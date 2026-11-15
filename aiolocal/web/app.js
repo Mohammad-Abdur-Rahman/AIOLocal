@@ -428,8 +428,14 @@
   async function deleteConversation() {
     if (!state.conversationId) { toast("There is no chat to delete.", true); return; }
     if (!confirm("Delete this chat and all of its messages? Summary memory is kept.")) return;
+    const forget = confirm(
+      "Also delete the summaries created from this chat? Choose Cancel to keep durable memory."
+    );
     try {
-      await api(`/conversations/${encodeURIComponent(state.conversationId)}`, { method: "DELETE" });
+      await api(
+        `/conversations/${encodeURIComponent(state.conversationId)}?with_summaries=${forget ? "true" : "false"}`,
+        { method: "DELETE" }
+      );
       state.conversationId = null;
       await refreshConversations();
       clearMessages();
@@ -972,9 +978,9 @@
 
   async function deleteSummary(id) {
     if (!id) return;
-    if (!confirm("Delete this memory entry? This cannot be undone.")) return;
+    if (!confirm("Delete this memory entry and the raw chat messages it was built from? This cannot be undone.")) return;
     try {
-      await api(`/memory/summaries/${encodeURIComponent(id)}`, { method: "DELETE" });
+      await api(`/memory/summaries/${encodeURIComponent(id)}?with_messages=true`, { method: "DELETE" });
       toast("Memory entry deleted.");
       await refreshMemory();
     } catch (err) {

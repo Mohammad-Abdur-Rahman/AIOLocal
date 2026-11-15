@@ -68,51 +68,142 @@ def find_conversation_by_external(db: Database, source: str, external_id: str) -
     return row["id"] if row else None
 
 
-def delete_conversation(db: Database, conversation_id: str) -> bool:
-    """Delete a chat and its messages, leaving summary memory untouched."""
+def _placeholders(count: int) -> str:
+    return ",".join("?" for _ in range(count))
+
+
+def _delete_message_rows(c: sqlite3.Connection, message_ids: list[str]) -> int:
+    """Delete raw messages and every index row that points at them.
+
+    Called by an explicit "forget" action, never by normal filing. Links from
+    other summaries are removed too, so no summary is left pointing at a row that
+    no longer exists.
+    """
+    ids = list(dict.fromkeys(mid for mid in message_ids if mid))
+    if not ids:
+        return 0
+    ph = _placeholders(len(ids))
+    c.execute(f"DELETE FROM messages_fts WHERE message_id IN ({ph})", tuple(ids))
+    c.execute(
+        f"DELETE FROM embeddings WHERE owner_type='message' AND owner_id IN ({ph})",
+        tuple(ids),
+    )
+    c.execute(f"DELETE FROM summary_messages WHERE message_id IN ({ph})", tuple(ids))
+    c.execute(f"DELETE FROM messages WHERE id IN ({ph})", tuple(ids))
+    return len(ids)
+
+
+def _delete_summary_rows(c: sqlite3.Connection, summary_id: str) -> list[str]:
+    """Delete a summary and its indexes; return the message ids it referenced."""
+    message_ids = [
+        r["message_id"]
+        for r in c.execute(
+            "SELECT message_id FROM summary_messages WHERE summary_id=?", (summary_id,)
+        )
+    ]
+    c.execute("DELETE FROM summaries_fts WHERE summary_id=?", (summary_id,))
+    c.execute(
+        "DELETE FROM embeddings WHERE owner_type='summary' AND owner_id=?",
+        (summary_id,),
+    )
+    c.execute("DELETE FROM summary_messages WHERE summary_id=?", (summary_id,))
+    c.execute(
+        "DELETE FROM summary_edges WHERE src=? OR dst=?", (summary_id, summary_id)
+    )
+    c.execute("DELETE FROM summaries WHERE id=?", (summary_id,))
+    return message_ids
+
+
+def prune_empty_topics(db: Database) -> int:
+    """Remove topics that still exist only because a summary was deleted."""
+    with db.write() as c:
+        cur = c.execute(
+            """DELETE FROM topics WHERE NOT EXISTS (
+                   SELECT 1 FROM summaries s WHERE s.topic_id=topics.id
+               ) AND NOT EXISTS (
+                   SELECT 1 FROM topics child WHERE child.parent_id=topics.id
+               )"""
+        )
+        return int(cur.rowcount or 0)
+
+
+def delete_summary(db: Database, summary_id: str, *, with_messages: bool = False) -> bool:
+    """Delete one summary and all of its indexes/links.
+
+    ``with_messages`` also deletes the raw chat messages the summary was built
+    from, along with their FTS rows, embeddings and any links held by other
+    summaries. That is the "forget this memory completely" path.
+    """
+    with db.write() as c:
+        exists = c.execute("SELECT 1 FROM summaries WHERE id=?", (summary_id,)).fetchone()
+        if not exists:
+            return False
+        message_ids = _delete_summary_rows(c, summary_id)
+        if with_messages:
+            _delete_message_rows(c, message_ids)
+        c.execute(
+            """DELETE FROM topics WHERE NOT EXISTS (
+                   SELECT 1 FROM summaries s WHERE s.topic_id=topics.id
+               ) AND NOT EXISTS (
+                   SELECT 1 FROM topics child WHERE child.parent_id=topics.id
+               )"""
+        )
+    return True
+
+
+def delete_conversation(
+    db: Database, conversation_id: str, *, with_summaries: bool = False
+) -> bool:
+    """Delete a chat and its messages.
+
+    Summary memory survives by default: it is the durable layer. With
+    ``with_summaries`` any summary whose *every* linked message belongs to this
+    conversation is deleted too, so a true "forget this chat" leaves no trace.
+    """
     with db.write() as c:
         exists = c.execute(
             "SELECT 1 FROM conversations WHERE id=?", (conversation_id,)
         ).fetchone()
         if not exists:
             return False
-        c.execute(
-            "DELETE FROM messages_fts WHERE message_id IN "
-            "(SELECT id FROM messages WHERE conversation_id=?)",
-            (conversation_id,),
-        )
-        c.execute(
-            "DELETE FROM embeddings WHERE owner_type='message' AND owner_id IN "
-            "(SELECT id FROM messages WHERE conversation_id=?)",
-            (conversation_id,),
-        )
-        c.execute(
-            "DELETE FROM summary_messages WHERE message_id IN "
-            "(SELECT id FROM messages WHERE conversation_id=?)",
-            (conversation_id,),
-        )
-        c.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
+        message_ids = [
+            r["id"]
+            for r in c.execute(
+                "SELECT id FROM messages WHERE conversation_id=?", (conversation_id,)
+            )
+        ]
+        if with_summaries and message_ids:
+            message_set = set(message_ids)
+            candidates = {
+                r["summary_id"]
+                for r in c.execute(
+                    f"""SELECT DISTINCT summary_id FROM summary_messages
+                        WHERE message_id IN ({_placeholders(len(message_ids))})""",
+                    tuple(message_ids),
+                )
+            }
+            for summary_id in candidates:
+                linked = {
+                    r["message_id"]
+                    for r in c.execute(
+                        "SELECT message_id FROM summary_messages WHERE summary_id=?",
+                        (summary_id,),
+                    )
+                }
+                # Only forget summaries that belong entirely to this chat;
+                # a merged summary may also carry memory from an older chat.
+                if linked and linked.issubset(message_set):
+                    _delete_summary_rows(c, summary_id)
+        _delete_message_rows(c, message_ids)
         c.execute("DELETE FROM retrieval_log WHERE conversation_id=?", (conversation_id,))
         c.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
-    return True
-
-
-def delete_summary(db: Database, summary_id: str) -> bool:
-    """Delete one summary and all of its indexes/links."""
-    with db.write() as c:
-        exists = c.execute("SELECT 1 FROM summaries WHERE id=?", (summary_id,)).fetchone()
-        if not exists:
-            return False
-        c.execute("DELETE FROM summaries_fts WHERE summary_id=?", (summary_id,))
         c.execute(
-            "DELETE FROM embeddings WHERE owner_type='summary' AND owner_id=?",
-            (summary_id,),
+            """DELETE FROM topics WHERE NOT EXISTS (
+                   SELECT 1 FROM summaries s WHERE s.topic_id=topics.id
+               ) AND NOT EXISTS (
+                   SELECT 1 FROM topics child WHERE child.parent_id=topics.id
+               )"""
         )
-        c.execute("DELETE FROM summary_messages WHERE summary_id=?", (summary_id,))
-        c.execute(
-            "DELETE FROM summary_edges WHERE src=? OR dst=?", (summary_id, summary_id)
-        )
-        c.execute("DELETE FROM summaries WHERE id=?", (summary_id,))
     return True
 
 
@@ -427,12 +518,17 @@ def bump_salience(db: Database, summary_ids: Iterable[str], amount: float = 0.02
         )
 
 
-def list_topics(db: Database) -> list[dict]:
+def list_topics(db: Database, *, include_empty: bool = False) -> list[dict]:
     with db.read() as c:
         rows = c.execute(
             """SELECT t.id, t.slug, t.name,
                       (SELECT COUNT(*) FROM summaries s WHERE s.topic_id=t.id AND s.merged_into IS NULL) AS count
-               FROM topics t ORDER BY t.slug"""
+               FROM topics t
+               WHERE ? OR EXISTS (
+                   SELECT 1 FROM summaries s WHERE s.topic_id=t.id AND s.merged_into IS NULL
+               )
+               ORDER BY t.slug""",
+            (1 if include_empty else 0,),
         ).fetchall()
     return [dict(r) for r in rows]
 

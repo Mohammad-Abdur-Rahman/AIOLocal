@@ -134,13 +134,15 @@ async def conversation_messages(conversation_id: str, request: Request):
 
 
 @router.delete("/conversations/{conversation_id}")
-async def conversation_delete(conversation_id: str, request: Request):
+async def conversation_delete(conversation_id: str, request: Request, with_summaries: bool = False):
     ctx: AppContext = request.app.state.ctx
     if not valid_id(conversation_id):
         return _err(400, "invalid conversation id", "invalid_id")
-    if not store.delete_conversation(ctx.db, conversation_id):
+    if not store.delete_conversation(
+        ctx.db, conversation_id, with_summaries=with_summaries
+    ):
         return _err(404, "conversation not found", "not_found")
-    return {"ok": True, "deleted": conversation_id}
+    return {"ok": True, "deleted": conversation_id, "with_summaries": with_summaries}
 
 
 # ------------------------------------------------------------------------- memory
@@ -170,13 +172,13 @@ async def summary_detail(summary_id: str, request: Request):
 
 
 @router.delete("/memory/summaries/{summary_id}")
-async def summary_delete(summary_id: str, request: Request):
+async def summary_delete(summary_id: str, request: Request, with_messages: bool = True):
     ctx: AppContext = request.app.state.ctx
     if not valid_id(summary_id):
         return _err(400, "invalid summary id", "invalid_id")
-    if not store.delete_summary(ctx.db, summary_id):
+    if not store.delete_summary(ctx.db, summary_id, with_messages=with_messages):
         return _err(404, "summary not found", "not_found")
-    return {"ok": True, "deleted": summary_id}
+    return {"ok": True, "deleted": summary_id, "with_messages": with_messages}
 
 
 @router.get("/memory/topics")

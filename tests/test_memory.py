@@ -220,3 +220,60 @@ def test_delete_summary_removes_indexes_and_links(tmp_path: Path):
     assert store.delete_summary(db, sid) is False
 
 
+def test_forget_summary_deletes_raw_messages_and_all_links(tmp_path: Path):
+    db, _ = make_db(tmp_path)
+    cid = "conv-forget"
+    store.ensure_conversation(db, cid)
+    mid, _ = store.archive_message(db, conversation_id=cid, role="user", content="forget me")
+    sid = store.insert_summary(db, title="Forget", body="temporary", message_ids=[mid])
+    other = store.insert_summary(db, title="Also linked", body="durable", message_ids=[mid])
+    store.put_embedding(db, "message", mid, "hash", np.ones(256, dtype=np.float32))
+
+    assert store.delete_summary(db, sid, with_messages=True) is True
+    assert store.get_summary(db, sid) is None
+    assert store.get_summary(db, other) is not None
+    assert store.message_by_id(db, mid) is None
+    assert store.summary_message_ids(db, other) == []
+    assert store.get_embeddings(db, "message", "hash") == []
+    with db.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0] == 0
+
+
+def test_forget_conversation_deletes_only_its_own_summaries(tmp_path: Path):
+    db, _ = make_db(tmp_path)
+    store.ensure_conversation(db, "conv-a")
+    store.ensure_conversation(db, "conv-b")
+    a_mid, _ = store.archive_message(db, conversation_id="conv-a", role="user", content="only a")
+    b_mid, _ = store.archive_message(db, conversation_id="conv-b", role="user", content="only b")
+    only_a = store.insert_summary(db, title="A", body="a", message_ids=[a_mid])
+    shared = store.insert_summary(db, title="Shared", body="s", message_ids=[a_mid, b_mid])
+
+    assert store.delete_conversation(db, "conv-a", with_summaries=True) is True
+    assert store.get_summary(db, only_a) is None
+    # A summary that also carries memory from another chat must survive.
+    assert store.get_summary(db, shared) is not None
+    assert store.message_by_id(db, a_mid) is None
+    assert store.message_by_id(db, b_mid) is not None
+
+
+def test_empty_topics_are_hidden_and_pruned(tmp_path: Path):
+    db, _ = make_db(tmp_path)
+    store.ensure_conversation(db, "conv-topics")
+    mid, _ = store.archive_message(db, conversation_id="conv-topics", role="user", content="topic test")
+    sid = store.insert_summary(db, title="Temporary", body="body", message_ids=[mid], topic_slug="temporary")
+    store.insert_summary(db, title="Kept", body="body", message_ids=[mid], topic_slug="kept")
+
+    assert {t["slug"] for t in store.list_topics(db)} == {"temporary", "kept"}
+    store.delete_summary(db, sid)
+    assert [t["slug"] for t in store.list_topics(db)] == ["kept"]
+    # Deleting the last summary of a topic prunes that topic immediately.
+    assert "temporary" not in {t["slug"] for t in store.list_topics(db, include_empty=True)}
+    with db.write() as c:
+        c.execute(
+            "INSERT INTO topics(id, slug, name, created_at) VALUES(?,?,?,?)",
+            ("orphan", "orphan", "orphan", 1),
+        )
+    assert store.prune_empty_topics(db) == 1
+    assert "orphan" not in {t["slug"] for t in store.list_topics(db, include_empty=True)}
+
+

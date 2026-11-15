@@ -256,7 +256,10 @@ class Database:
                 "messages": one("SELECT COUNT(*) FROM messages"),
                 "conversations": one("SELECT COUNT(*) FROM conversations"),
                 "summaries": one("SELECT COUNT(*) FROM summaries WHERE merged_into IS NULL"),
-                "topics": one("SELECT COUNT(*) FROM topics"),
+                "topics": one(
+                    "SELECT COUNT(*) FROM topics t WHERE EXISTS "
+                    "(SELECT 1 FROM summaries s WHERE s.topic_id=t.id AND s.merged_into IS NULL)"
+                ),
                 "jobs_pending": one("SELECT COUNT(*) FROM memory_jobs WHERE state='queued'"),
                 "jobs_failed": one("SELECT COUNT(*) FROM memory_jobs WHERE state='failed'"),
             }

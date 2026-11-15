@@ -104,9 +104,9 @@ class Settings:
     embedding_model: str = "qwen3-embedding-0.6b"
     embed_dim: int = 256
     # Document vision (PDF pages -> main vision model -> summary memory)
-    document_pages_per_batch: int = 3
+    document_pages_per_batch: int = 1
     document_dpi: int = 140
-    document_max_pages: int = 300
+    document_max_pages: int = 0
     document_keep_pages: bool = False
     # Local OVMS
     ovms_path: str = ""
@@ -147,7 +147,7 @@ class Settings:
         self.embed_dim = max(64, min(int(self.embed_dim), 2048))
         self.document_pages_per_batch = max(1, min(int(self.document_pages_per_batch), 8))
         self.document_dpi = max(72, min(int(self.document_dpi), 220))
-        self.document_max_pages = max(1, min(int(self.document_max_pages), 2000))
+        self.document_max_pages = max(0, min(int(self.document_max_pages), 20000))
         if self.embedding_backend not in ("hash", "ovms"):
             self.embedding_backend = "hash"
         self.temperature = max(0.0, min(float(self.temperature), 2.0))

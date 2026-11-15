@@ -12,6 +12,7 @@ the database grows.
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -221,6 +222,107 @@ def _rrf(lists: list[list[str]]) -> dict[str, float]:
     return fused
 
 
+DOCUMENT_WORDS = {
+    "pdf", "document", "documents", "page", "pages", "paper", "report",
+    "attachment", "attached", "file", "chapter", "section", "figure", "table",
+}
+
+
+def _document_items(
+    db: Database,
+    query: str,
+    settings: Settings,
+    *,
+    section_limit: int = 2,
+    page_limit: int = 4,
+) -> list[MemoryItem]:
+    """Retrieve section summaries and exact pages from uploaded documents.
+
+    The document summary is only an index now; the facts live in these rows. Page
+    text is returned verbatim so the model can quote it instead of guessing from an
+    overview.
+    """
+    section_ids = _vector_lists(
+        db, "document_section", query, settings,
+        threshold=0.10, limit=60, cap=40_000,
+    )
+    page_ids = _vector_lists(
+        db, "document_page", query, settings,
+        threshold=0.14, limit=60, cap=80_000,
+    )
+    items: list[MemoryItem] = []
+    seen_sections: set[str] = set()
+    seen_pages: set[str] = set()
+    with db.read() as c:
+        for rank, key in enumerate(section_ids):
+            if len(seen_sections) >= section_limit:
+                break
+            parts = key.split(":")
+            if len(parts) != 3:
+                continue
+            doc_id, level, ordinal = parts[0], parts[1], parts[2]
+            if key in seen_sections:
+                continue
+            row = c.execute(
+                """SELECT s.page_from, s.page_to, s.summary, s.created_at AS section_at,
+                          d.title, d.created_at AS doc_at
+                   FROM document_sections s JOIN summaries d ON d.id=s.document_id
+                   WHERE s.document_id=? AND s.level=? AND s.ordinal=?""",
+                (doc_id, int(level) if level.isdigit() else 1, int(ordinal) if ordinal.isdigit() else 0),
+            ).fetchone()
+            if not row:
+                continue
+            seen_sections.add(key)
+            title = f"{row['title']} — pages {row['page_from']}-{row['page_to']}"
+            body = row["summary"]
+            items.append(
+                MemoryItem(
+                    kind="document_section",
+                    id=key,
+                    title=title,
+                    body=body,
+                    score=1.0 / (RRF_K + rank + 1),
+                    created_at=int(row["section_at"] or row["doc_at"] or 0),
+                    salience=0.62,
+                    tokens=estimate_tokens(body) + estimate_tokens(title),
+                    summary_kind="document_section",
+                )
+            )
+        for rank, key in enumerate(page_ids):
+            if len(seen_pages) >= page_limit:
+                break
+            parts = key.split(":")
+            if len(parts) != 2 or not parts[1].isdigit():
+                continue
+            if key in seen_pages:
+                continue
+            row = c.execute(
+                """SELECT p.page_no, p.text, p.created_at AS page_at, d.title
+                   FROM document_pages p JOIN summaries d ON d.id=p.document_id
+                   WHERE p.document_id=? AND p.page_no=?""",
+                (parts[0], int(parts[1])),
+            ).fetchone()
+            if not row:
+                continue
+            seen_pages.add(key)
+            title = f"{row['title']} — page {row['page_no']}"
+            body = str(row["text"])[:6000]
+            items.append(
+                MemoryItem(
+                    kind="document_page",
+                    id=key,
+                    title=title,
+                    body=body,
+                    score=1.0 / (RRF_K + rank + 1),
+                    created_at=int(row["page_at"] or 0),
+                    salience=0.66,
+                    tokens=estimate_tokens(body) + estimate_tokens(title),
+                    summary_kind="document_page",
+                )
+            )
+    return items
+
+
 def _group_exact(db: Database, message_ids: list[str], fused: dict[str, float]) -> list[MemoryItem]:
     rows = store.messages_by_ids(db, message_ids)
     if not rows:
@@ -383,6 +485,19 @@ def retrieve(
         plan["gate"] = "below_threshold"
         ordered = []
 
+    # Documents are stored as pages + sections. Pull exact excerpts when the query
+    # is document-shaped, or whenever a document summary was already retrieved.
+    doc_items: list[MemoryItem] = []
+    try:
+        words = set(re.findall(r"[a-z]+", q.lower()))
+        has_doc = any(i.summary_kind == "document" for i in ordered)
+        if has_doc or (words & DOCUMENT_WORDS):
+            doc_items = _document_items(db, q, settings)
+            if doc_items:
+                plan["sources"]["document"] = [i.id for i in doc_items]
+    except Exception as exc:  # pragma: no cover - defensive
+        plan["sources"]["document_error"] = str(exc)[:200]
+
     # Expand the messages behind the selected summaries, plus direct message hits.
     expand_ids: list[str] = []
     for item in ordered:
@@ -400,7 +515,7 @@ def retrieve(
         except Exception as exc:  # pragma: no cover
             plan["exact_error"] = str(exc)[:200]
 
-    items = exact_items + ordered
+    items = doc_items + exact_items + ordered
     plan["selected"] = [i.to_dict() for i in items]
     latency = int((time.perf_counter() - t0) * 1000)
     plan["latency_ms"] = latency

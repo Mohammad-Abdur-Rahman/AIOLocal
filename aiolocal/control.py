@@ -176,6 +176,10 @@ async def summary_delete(summary_id: str, request: Request, with_messages: bool 
     ctx: AppContext = request.app.state.ctx
     if not valid_id(summary_id):
         return _err(400, "invalid summary id", "invalid_id")
+    if ctx.documents:
+        for job in ctx.documents.recent(limit=100):
+            if job.get("summary_id") == summary_id and job.get("state") in ("queued", "running"):
+                ctx.documents.cancel(job["id"])
     if not store.delete_summary(ctx.db, summary_id, with_messages=with_messages):
         return _err(404, "summary not found", "not_found")
     return {"ok": True, "deleted": summary_id, "with_messages": with_messages}

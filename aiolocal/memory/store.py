@@ -106,6 +106,15 @@ def _delete_summary_rows(c: sqlite3.Connection, summary_id: str) -> list[str]:
         "DELETE FROM embeddings WHERE owner_type='summary' AND owner_id=?",
         (summary_id,),
     )
+    # A document summary owns page rows, section rows, their vectors and its job.
+    c.execute(
+        "DELETE FROM embeddings WHERE owner_type IN ('document_page','document_section') "
+        "AND owner_id LIKE ?",
+        (f"{summary_id}:%",),
+    )
+    c.execute("DELETE FROM document_pages WHERE document_id=?", (summary_id,))
+    c.execute("DELETE FROM document_sections WHERE document_id=?", (summary_id,))
+    c.execute("DELETE FROM document_jobs WHERE summary_id=?", (summary_id,))
     c.execute("DELETE FROM summary_messages WHERE summary_id=?", (summary_id,))
     c.execute(
         "DELETE FROM summary_edges WHERE src=? OR dst=?", (summary_id, summary_id)

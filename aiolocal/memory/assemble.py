@@ -95,19 +95,24 @@ def _render_system(
         parts.append("\n" + MEDICAL_DISCLAIMER)
 
     if items:
-        has_document = any(i.summary_kind == "document" for i in items)
+        has_document = any(
+            str(i.summary_kind).startswith("document") for i in items
+        )
         if has_document:
             parts.append(
-                "\n\nDOCUMENT MEMORY: The document notes below were produced by reading the "
-                "attached PDF page by page with the vision model. Treat them as the document "
-                "contents. Answer from them and do not claim you cannot see or read the "
-                "document when its notes are present.\n"
+                "\n\nDOCUMENT MEMORY: The document excerpts below were produced by reading "
+                "the attached PDF page by page with the vision model. Page excerpts are "
+                "verbatim notes for that page. Treat them as the document contents. Answer "
+                "from them and do not claim you cannot see or read the document when its "
+                "notes are present.\n"
             )
         parts.append("\n\n## What you remember (retrieved)\n")
         for item in items:
             if item.kind == "summary":
                 tag = f"  [{item.topic}]" if item.topic else ""
                 parts.append(f"### Summary — {item.title}{tag}\n{item.body}\n")
+            elif item.kind in ("document_page", "document_section"):
+                parts.append(f"### Document excerpt — {item.title}\n{item.body}\n")
             else:
                 ids = ", ".join(item.message_ids[:6])
                 parts.append(f"### {item.title}  (messages {ids})\n{item.body}\n")
@@ -246,8 +251,13 @@ def assemble(
 
     summaries = [i for i in items if i.kind == "summary"]
     exact = [i for i in items if i.kind == "exact"]
-    documents = [i for i in summaries if i.summary_kind == "document"]
-    other_summaries = [i for i in summaries if i.summary_kind != "document"]
+    documents = [
+        i for i in items
+        if str(i.summary_kind).startswith("document")
+    ]
+    other_summaries = [
+        i for i in summaries if not str(i.summary_kind).startswith("document")
+    ]
 
     # Document summaries are the complete analysis of a PDF the user attached.
     # They are large and must not be crowded out by incidental exact excerpts, so

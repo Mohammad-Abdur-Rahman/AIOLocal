@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -132,6 +132,43 @@ CREATE TABLE IF NOT EXISTS images (
   meta       TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_images_time ON images(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS document_jobs (
+  id          TEXT PRIMARY KEY,
+  filename    TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  model       TEXT,
+  state       TEXT NOT NULL DEFAULT 'queued',
+  summary_id  TEXT,
+  pages_total INTEGER NOT NULL DEFAULT 0,
+  pages_done  INTEGER NOT NULL DEFAULT 0,
+  error       TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_docjob_state ON document_jobs(state, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS document_pages (
+  document_id TEXT NOT NULL,
+  page_no     INTEGER NOT NULL,
+  text        TEXT NOT NULL,
+  tokens      INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (document_id, page_no)
+);
+
+CREATE TABLE IF NOT EXISTS document_sections (
+  document_id TEXT NOT NULL,
+  ordinal     INTEGER NOT NULL,
+  level       INTEGER NOT NULL DEFAULT 1,
+  page_from   INTEGER NOT NULL,
+  page_to     INTEGER NOT NULL,
+  summary     TEXT NOT NULL,
+  tokens      INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (document_id, level, ordinal)
+);
 
 CREATE TABLE IF NOT EXISTS retrieval_log (
   id         TEXT PRIMARY KEY,

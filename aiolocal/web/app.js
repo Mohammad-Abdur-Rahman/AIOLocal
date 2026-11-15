@@ -726,9 +726,42 @@
       running: `Reading pages ${done}/${total || "?"} — batch ${job.batches_done || 0}/${job.batches_total || "?"}`,
       done: "Saved to memory.",
       error: `Failed: ${job.error || "unknown error"}`,
-      cancelled: "Cancelled.",
+      cancelled: "Cancelled. Finished pages are kept.",
+      interrupted: `Paused at page ${done}/${total || "?"}. It resumes when the app restarts.`,
     }[job.state] || job.state;
     $("#chat-doc-status").textContent = stateText;
+    const cancel = $("#chat-doc-cancel");
+    if (cancel) {
+      cancel.classList.toggle("hidden", !["queued", "running"].includes(job.state));
+    }
+  }
+
+  async function cancelDocumentJob() {
+    const job = state.chatDocJob;
+    if (!job || !job.id) return;
+    try {
+      await api(`/documents/jobs/${encodeURIComponent(job.id)}/cancel`, { method: "POST" });
+      toast("Cancelling after the current page.");
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  async function attachLatestDocumentJob() {
+    try {
+      const payload = await api("/documents/jobs?limit=1");
+      const job = (payload.data || [])[0];
+      if (!job) return;
+      if (!["queued", "running", "interrupted"].includes(job.state)) return;
+      if (!job.pages_total) return;
+      state.chatDocJob = job;
+      renderDocumentJob(job);
+      if (["queued", "running"].includes(job.state)) {
+        state.chatDocTimer = setInterval(pollDocumentJob, 1500);
+      }
+    } catch {
+      /* the widget is optional */
+    }
   }
 
   function stopDocumentPolling() {
@@ -752,7 +785,7 @@
       const current = await api(`/documents/jobs/${encodeURIComponent(job.id)}`);
       state.chatDocJob = current;
       renderDocumentJob(current);
-      if (["done", "error", "cancelled"].includes(current.state)) {
+      if (["done", "error", "cancelled", "interrupted"].includes(current.state)) {
         stopDocumentPolling();
         if (current.state === "done") {
           appendDocumentMemory(current);
@@ -2231,6 +2264,7 @@
     });
     $("#chat-attachment-remove").addEventListener("click", clearChatImage);
     $("#chat-add-document").addEventListener("click", () => $("#chat-document-input").click());
+    $("#chat-doc-cancel").addEventListener("click", cancelDocumentJob);
     $("#chat-document-input").addEventListener("change", (event) => {
       const file = event.target.files && event.target.files[0];
       if (file) startDocumentAnalysis(file);
@@ -2418,6 +2452,7 @@
 
     await refreshConversations();
     await refreshKnowledge();
+    await attachLatestDocumentJob();
     const first = state.conversations[0];
     if (first) {
       $("#conversation-select").value = first.id;

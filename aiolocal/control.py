@@ -416,12 +416,15 @@ async def knowledge_status(request: Request):
     ctx: AppContext = request.app.state.ctx
     if not ctx.kb:
         return _kb_unavailable()
-    return {
+    payload = {
         "stats": ctx.kb.stats(),
         "collections": ctx.kb.list_collections(),
         "inbox": str(ctx.paths.knowledge_inbox),
         "files": str(ctx.paths.knowledge_files),
     }
+    if ctx.kb_worker is not None:
+        payload["worker"] = ctx.kb_worker.status()
+    return payload
 
 
 @router.get("/knowledge/collections")
@@ -451,7 +454,7 @@ async def knowledge_collection_create(request: Request):
     return {"ok": True, "id": collection_id, "collections": ctx.kb.list_collections()}
 
 
-@router.delete("/knowledge/collections/{slug}")
+@router.delete("/knowledge/collections/{slug:path}")
 async def knowledge_collection_delete(slug: str, request: Request):
     ctx: AppContext = request.app.state.ctx
     if not ctx.kb:
@@ -459,6 +462,22 @@ async def knowledge_collection_delete(slug: str, request: Request):
     if not ctx.kb.delete_collection(slug):
         return _err(404, "collection not found", "not_found")
     return {"ok": True, "collections": ctx.kb.list_collections()}
+
+
+@router.post("/knowledge/folders/rebuild")
+async def knowledge_folders_rebuild(request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if not ctx.kb:
+        return _kb_unavailable()
+    try:
+        from starlette.concurrency import run_in_threadpool
+
+        result = await run_in_threadpool(
+            ctx.kb.rebuild_folder_summaries, embed_dim=ctx.settings.embed_dim
+        )
+    except Exception as exc:
+        return _err(500, f"could not rebuild folder summaries: {exc}", "folder_rebuild_failed")
+    return {"ok": True, **result, "collections": ctx.kb.list_collections()}
 
 
 @router.get("/knowledge/documents")
@@ -584,13 +603,46 @@ async def knowledge_search(request: Request):
         limit = max(1, min(int(body.get("limit") or ctx.settings.knowledge_top_k), 20))
     except (TypeError, ValueError):
         limit = ctx.settings.knowledge_top_k
-    rows = ctx.kb.search(
-        query,
-        collections=[str(c) for c in collections if str(c).strip()],
-        limit=limit,
-        embed_dim=ctx.settings.embed_dim,
-    )
+    auto = bool(body.get("auto")) or any(str(c).strip().lower() == "auto" for c in collections)
+    try:
+        if auto:
+            routed = ctx.kb.search_auto(
+                query,
+                limit=limit,
+                embed_dim=ctx.settings.embed_dim,
+                max_folders=ctx.settings.knowledge_auto_folders,
+            )
+            return {
+                "data": routed.get("items") or [],
+                "routing": routed.get("routing") or {},
+                "query": query,
+            }
+        rows = ctx.kb.search(
+            query,
+            collections=[str(c) for c in collections if str(c).strip()],
+            limit=limit,
+            embed_dim=ctx.settings.embed_dim,
+        )
+    except Exception as exc:
+        return _err(500, f"knowledge search failed: {exc}", "search_failed")
     return {"data": rows, "query": query}
+
+
+@router.post("/knowledge/enrich")
+async def knowledge_enrich(request: Request):
+    """Run one enrichment batch now instead of waiting for the worker cycle."""
+    ctx: AppContext = request.app.state.ctx
+    if not ctx.kb:
+        return _kb_unavailable()
+    if ctx.kb_worker is None:
+        return _err(503, "the knowledge worker is not running", "worker_unavailable")
+    try:
+        from starlette.concurrency import run_in_threadpool
+
+        count = await run_in_threadpool(ctx.kb_worker.enrich, ctx.settings)
+    except Exception as exc:
+        return _err(500, f"enrichment failed: {exc}", "enrich_failed")
+    return {"ok": True, "enriched": count, "stats": ctx.kb.stats()}
 
 
 @router.post("/knowledge/scan")
@@ -598,6 +650,13 @@ async def knowledge_scan(request: Request):
     ctx: AppContext = request.app.state.ctx
     if not ctx.kb:
         return _kb_unavailable()
+    limit = 0
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and body.get("limit") is not None:
+            limit = max(0, min(int(body.get("limit") or 0), 100000))
+    except Exception:
+        limit = 0
     try:
         from starlette.concurrency import run_in_threadpool
 
@@ -605,9 +664,13 @@ async def knowledge_scan(request: Request):
             ctx.kb.scan_inbox,
             ctx.paths.knowledge_inbox,
             embed_dim=ctx.settings.embed_dim,
-            limit=40,
+            limit=limit,
             docling_path=ctx.settings.docling_path,
         )
+        if result.get("added"):
+            await run_in_threadpool(
+                ctx.kb.rebuild_folder_summaries, embed_dim=ctx.settings.embed_dim
+            )
     except Exception as exc:
         return _err(500, f"inbox scan failed: {exc}", "scan_failed")
     if ctx.kb_worker:

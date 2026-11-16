@@ -1523,7 +1523,9 @@
     const box = $("#kb-doc-list");
     const filter = $("#kb-filter").value;
     const rows = (state.knowledge && state.knowledge.documents) || [];
-    const shown = filter ? rows.filter((d) => d.collection === filter) : rows;
+    const shown = filter
+      ? rows.filter((d) => d.collection === filter || String(d.collection || "").startsWith(filter + "/"))
+      : rows;
     if (!shown.length) {
       box.innerHTML = '<p class="muted small">No documents yet. Upload one or drop files in the inbox and scan.</p>';
       return;
@@ -1541,15 +1543,60 @@
       </div>`).join("");
   }
 
+  function renderKnowledgeFolders(collections) {
+    const box = $("#kb-folder-list");
+    if (!box) return;
+    const rows = collections || [];
+    if (!rows.length) {
+      box.innerHTML = '<p class="muted small">No folders yet. Put files in the inbox or upload a document.</p>';
+      return;
+    }
+    box.innerHTML = rows.map((c) => {
+      const depth = Number(c.depth || 0);
+      const indent = Math.min(depth, 4) * 18;
+      const summary = c.summary_preview || "No folder summary yet.";
+      return `
+        <div class="doc-row" style="margin-left:${indent}px">
+          <div class="doc-main">
+            <div class="doc-title">${escapeHtml(c.name || c.slug)}
+              <span class="muted small">(${Number(c.subtree_documents ?? c.documents ?? 0)} docs)</span>
+              ${c.has_summary ? '<span class="tag ok">indexed</span>' : '<span class="tag">no index</span>'}
+            </div>
+            <div class="doc-sub">${escapeHtml(c.slug || "general")} · ${Number(c.documents || 0)} here · ${Number(c.chunks || 0)} chunks</div>
+            <div class="doc-sub">${escapeHtml(String(summary).slice(0, 220))}</div>
+          </div>
+          <button class="btn danger small" data-kb-folder-delete="${escapeAttr(c.slug)}" type="button">Delete</button>
+        </div>`;
+    }).join("");
+  }
+
+  function renderKnowledgeWorker(worker) {
+    const tag = $("#kb-worker");
+    if (!tag) return;
+    const w = worker || {};
+    if (w.running) {
+      const parts = [`${w.phase || "working"}`];
+      if (w.seen) parts.push(`${w.seen} seen`);
+      if (w.added) parts.push(`${w.added} added`);
+      if (w.enriched) parts.push(`${w.enriched} enriched`);
+      tag.textContent = parts.join(" · ");
+      tag.className = "tag ok";
+    } else {
+      tag.textContent = w.error ? `error: ${String(w.error).slice(0, 80)}` : "idle";
+      tag.className = w.error ? "tag err" : "tag";
+    }
+  }
+
   function populateKnowledgeSelect(collections) {
     const select = $("#chat-knowledge");
     if (!select) return;
     const current = select.value;
     select.innerHTML = '<option value="">Knowledge: off</option>' +
+      '<option value="auto">Auto (route by folder)</option>' +
       (collections || []).map((c) =>
-        `<option value="${escapeAttr(c.slug)}">${escapeHtml(c.name || c.slug)} (${c.documents || 0})</option>`
+        `<option value="${escapeAttr(c.slug)}">${"&nbsp;".repeat(Number(c.depth || 0) * 2)}${escapeHtml(c.name || c.slug)} (${c.subtree_documents ?? c.documents ?? 0})</option>`
       ).join("");
-    if (current && (collections || []).some((c) => c.slug === current)) select.value = current;
+    if (current && Array.from(select.options).some((o) => o.value === current)) select.value = current;
   }
 
   async function refreshKnowledge() {
@@ -1562,12 +1609,14 @@
       renderKnowledgeStats(status.stats);
       $("#kb-inbox").textContent = status.inbox || "—";
       populateKnowledgeSelect(status.collections || []);
+      renderKnowledgeFolders(status.collections || []);
+      renderKnowledgeWorker(status.worker);
 
       const filter = $("#kb-filter");
       const current = filter.value;
       filter.innerHTML = '<option value="">All collections</option>' +
         (status.collections || []).map((c) =>
-          `<option value="${escapeAttr(c.slug)}">${escapeHtml(c.name || c.slug)} (${c.documents})</option>`).join("");
+          `<option value="${escapeAttr(c.slug)}">${escapeHtml(c.slug)} (${c.subtree_documents ?? c.documents})</option>`).join("");
       filter.value = current;
       renderKnowledgeDocs();
     } catch (err) {
@@ -1630,10 +1679,25 @@
     const query = $("#kb-query").value.trim();
     if (!query) return;
     const box = $("#kb-results");
+    const routeBox = $("#kb-route");
+    const auto = $("#kb-auto-route") ? $("#kb-auto-route").checked : true;
     box.innerHTML = '<p class="muted small">Searching…</p>';
+    if (routeBox) routeBox.textContent = "";
     try {
-      const payload = await api("/knowledge/search", { method: "POST", body: { query } });
+      const payload = await api("/knowledge/search", { method: "POST", body: { query, auto } });
       const rows = payload.data || [];
+      const routing = payload.routing || {};
+      if (routeBox) {
+        if (routing.mode === "folder") {
+          routeBox.textContent = `Routed to ${(routing.collections || []).join(", ")}`;
+        } else if (routing.mode === "global") {
+          routeBox.textContent = `Global search (${routing.reason || "no folder match"})`;
+        } else if (routing.abstained) {
+          routeBox.textContent = "Nothing relevant enough to answer from the knowledge base.";
+        } else {
+          routeBox.textContent = "";
+        }
+      }
       if (!rows.length) {
         box.innerHTML = '<p class="muted small">No matching chunks.</p>';
         return;
@@ -1650,6 +1714,50 @@
           </div>`).join("");
     } catch (err) {
       box.innerHTML = "";
+      toast(err.message, true);
+    }
+  }
+
+  async function rebuildKnowledgeFolders() {
+    const button = $("#kb-rebuild-folders");
+    button.disabled = true;
+    $("#kb-status").textContent = "Rebuilding folder summaries…";
+    try {
+      const result = await api("/knowledge/folders/rebuild", { method: "POST" });
+      $("#kb-status").textContent = `Indexed ${result.updated || 0} folders (${result.empty || 0} empty).`;
+      await refreshKnowledge();
+    } catch (err) {
+      $("#kb-status").textContent = "";
+      toast(err.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function enrichKnowledgeNow() {
+    const button = $("#kb-enrich");
+    button.disabled = true;
+    $("#kb-status").textContent = "Enriching documents…";
+    try {
+      const result = await api("/knowledge/enrich", { method: "POST" });
+      $("#kb-status").textContent = `Enriched ${result.enriched || 0} documents.`;
+      await refreshKnowledge();
+    } catch (err) {
+      $("#kb-status").textContent = "";
+      toast(err.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function deleteKnowledgeFolder(slug) {
+    if (!slug) return;
+    if (!window.confirm(`Delete the folder "${slug}" and every document inside it?`)) return;
+    try {
+      await api(`/knowledge/collections/${encodeURIComponent(slug)}`, { method: "DELETE" });
+      toast("Folder deleted.");
+      await refreshKnowledge();
+    } catch (err) {
       toast(err.message, true);
     }
   }
@@ -2215,6 +2323,23 @@
     source.addEventListener("knowledge_document", () => {
       if (state.view === "documents") refreshKnowledge();
     });
+    source.addEventListener("knowledge_progress", (event) => {
+      if (state.view !== "documents") return;
+      try {
+        const data = JSON.parse(event.data);
+        renderKnowledgeWorker({ running: true, phase: "scanning", ...data });
+      } catch { /* progress is optional */ }
+    });
+    source.addEventListener("knowledge_folders", () => {
+      if (state.view === "documents") refreshKnowledge();
+    });
+    source.addEventListener("knowledge_idle", (event) => {
+      if (state.view !== "documents") return;
+      try {
+        renderKnowledgeWorker(JSON.parse(event.data));
+      } catch { /* ignore */ }
+      refreshKnowledge();
+    });
     source.addEventListener("code_status", (event) => {
       if (state.view !== "code") return;
       let running = true;
@@ -2369,10 +2494,16 @@
     $("#kb-upload").addEventListener("click", uploadKnowledge);
     $("#kb-scan").addEventListener("click", scanKnowledgeInbox);
     $("#kb-search").addEventListener("click", searchKnowledge);
+    $("#kb-rebuild-folders").addEventListener("click", rebuildKnowledgeFolders);
+    $("#kb-enrich").addEventListener("click", enrichKnowledgeNow);
     $("#kb-query").addEventListener("keydown", (event) => {
       if (event.key === "Enter") { event.preventDefault(); searchKnowledge(); }
     });
     $("#kb-filter").addEventListener("change", renderKnowledgeDocs);
+    $("#kb-folder-list").addEventListener("click", (event) => {
+      const del = event.target.closest("[data-kb-folder-delete]");
+      if (del) { deleteKnowledgeFolder(del.dataset.kbFolderDelete); }
+    });
     $("#kb-doc-list").addEventListener("click", (event) => {
       const del = event.target.closest("[data-kb-delete]");
       if (del) { deleteKnowledgeDocument(del.dataset.kbDelete); return; }

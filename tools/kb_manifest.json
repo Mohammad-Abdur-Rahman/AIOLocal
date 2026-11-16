@@ -1,0 +1,84 @@
+{
+  "tier": 1,
+  "description": "Primary reference material for the AIOLocal feature set: the local gateway, OVMS/OpenVINO, Qwen, PDF rendering and SQLite search.",
+  "sources": [
+    {
+      "name": "fastapi",
+      "folder": "dev/fastapi",
+      "type": "git",
+      "url": "https://github.com/fastapi/fastapi",
+      "license": "MIT",
+      "includes": [
+        {"path": "docs/en/docs"},
+        {"path": "README.md"}
+      ]
+    },
+    {
+      "name": "ovms",
+      "folder": "ai/ovms",
+      "type": "git",
+      "url": "https://github.com/openvinotoolkit/model_server",
+      "license": "Apache-2.0",
+      "includes": [
+        {"path": "docs"},
+        {"path": "README.md"}
+      ]
+    },
+    {
+      "name": "openvino-genai",
+      "folder": "ai/openvino-genai",
+      "type": "git",
+      "url": "https://github.com/openvinotoolkit/openvino.genai",
+      "license": "Apache-2.0",
+      "includes": [
+        {"path": "site/docs"},
+        {"path": "README.md"}
+      ]
+    },
+    {
+      "name": "qwen3",
+      "folder": "ai/qwen3",
+      "type": "git",
+      "url": "https://github.com/QwenLM/Qwen3",
+      "license": "Apache-2.0",
+      "includes": [
+        {"path": "docs/source"},
+        {"path": "README.md"}
+      ]
+    },
+    {
+      "name": "pypdfium2",
+      "folder": "dev/pdfium",
+      "type": "git",
+      "url": "https://github.com/pypdfium2-team/pypdfium2",
+      "license": "Apache-2.0 / BSD-3-Clause",
+      "includes": [
+        {"path": "docs"},
+        {"path": "README.md"}
+      ]
+    },
+    {
+      "name": "sqlite",
+      "folder": "dev/sqlite",
+      "type": "url",
+      "license": "Public domain",
+      "urls": [
+        {"url": "https://www.sqlite.org/fts5.html", "title": "SQLite FTS5 extension"},
+        {"url": "https://www.sqlite.org/lang_select.html", "title": "SQLite SELECT"},
+        {"url": "https://www.sqlite.org/lang_transaction.html", "title": "SQLite transactions"},
+        {"url": "https://www.sqlite.org/wal.html", "title": "SQLite WAL mode"}
+      ]
+    },
+    {
+      "name": "python-stdlib",
+      "folder": "dev/python",
+      "type": "url",
+      "license": "PSF-2.0",
+      "urls": [
+        {"url": "https://docs.python.org/3/library/sqlite3.html", "title": "Python sqlite3"},
+        {"url": "https://docs.python.org/3/library/contextlib.html", "title": "Python contextlib"},
+        {"url": "https://docs.python.org/3/library/asyncio-task.html", "title": "Python asyncio tasks"}
+      ]
+    }
+  ]
+}

@@ -116,6 +116,7 @@
             <button type="button" id="chat-add-document" class="btn ghost small" title="Read every PDF page with the main vision model and save the result to memory">Add document</button>
             <select id="chat-knowledge" class="compact-select" aria-label="Knowledge collection for this message" title="Reference the knowledge base for this message only">
               <option value="">Knowledge: off</option>
+              <option value="auto">Auto (route by folder)</option>
             </select>
             <span class="hint">Enter to send · Shift+Enter for a new line</span>
             <span class="grow"></span>
@@ -272,6 +273,7 @@
           <div class="row wrap">
             <button id="kb-upload" class="btn primary" type="button">Upload</button>
             <button id="kb-scan" class="btn ghost" type="button">Scan inbox</button>
+            <button id="kb-enrich" class="btn ghost" type="button">Enrich now</button>
           </div>
           <p id="kb-status" class="muted small"></p>
           <p class="muted small">Inbox: <code id="kb-inbox">—</code></p>
@@ -279,13 +281,27 @@
 
         <div class="card">
           <h2>Search knowledge</h2>
-          <p class="muted">Hybrid keyword + local-vector search over the knowledge DB only. Conversation memory stays separate.</p>
+          <p class="muted">Hybrid keyword + local-vector search over the knowledge DB only. Auto-route picks the folders first, then searches inside them. Conversation memory stays separate.</p>
           <div class="row">
             <input id="kb-query" type="text" placeholder="e.g. optical flow constraints" class="grow">
+            <label class="inline-check"><input id="kb-auto-route" type="checkbox" checked> Auto-route</label>
             <button id="kb-search" class="btn primary" type="button">Search</button>
           </div>
+          <div id="kb-route" class="muted small"></div>
           <div id="kb-results" class="results"></div>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="section-head tight">
+          <h2>Folders</h2>
+          <div class="row wrap">
+            <button id="kb-rebuild-folders" class="btn ghost small" type="button">Rebuild folder index</button>
+            <span id="kb-worker" class="tag">idle</span>
+          </div>
+        </div>
+        <p class="muted small">Each nested inbox folder becomes a collection. Its summary is the routing index for automatic search.</p>
+        <div id="kb-folder-list" class="doc-list"></div>
       </div>
 
       <div class="card">

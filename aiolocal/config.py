@@ -118,6 +118,8 @@ class Settings:
     # Knowledge base (separate from conversation memory; opt-in per message)
     knowledge_enabled: bool = True
     knowledge_top_k: int = 6
+    knowledge_enrich_batch: int = 20
+    knowledge_auto_folders: int = 3
     docling_path: str = ""
     knowledge_scan_seconds: int = 120
     # Web search (off by default; each message must opt in)
@@ -152,6 +154,8 @@ class Settings:
             self.embedding_backend = "hash"
         self.temperature = max(0.0, min(float(self.temperature), 2.0))
         self.knowledge_top_k = max(1, min(int(self.knowledge_top_k), 20))
+        self.knowledge_enrich_batch = max(1, min(int(self.knowledge_enrich_batch), 100))
+        self.knowledge_auto_folders = max(1, min(int(self.knowledge_auto_folders), 6))
         self.knowledge_scan_seconds = max(0, min(int(self.knowledge_scan_seconds), 3600))
         self.web_search_max_results = max(1, min(int(self.web_search_max_results), 10))
         self.opencode_port = max(1024, min(int(self.opencode_port), 65535))

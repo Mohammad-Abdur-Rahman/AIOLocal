@@ -1,0 +1,33 @@
+{
+  "description": "Project questions used to verify that the downloaded corpus actually answers AIOLocal-related work. Each positive query names the folder that should own the answer and at least one term that must appear in a top-5 chunk.",
+  "positive": [
+    {"query": "How do I create a FastAPI dependency that yields a database session?", "folder": "dev/fastapi", "terms": ["dependency", "yield"]},
+    {"query": "FastAPI response model and status code declaration", "folder": "dev/fastapi", "terms": ["response_model", "status_code"]},
+    {"query": "FastAPI streaming response for server-sent events", "folder": "dev/fastapi", "terms": ["StreamingResponse"]},
+    {"query": "FastAPI OAuth2 password bearer token", "folder": "dev/fastapi", "terms": ["OAuth2PasswordBearer"]},
+    {"query": "FastAPI background tasks after returning a response", "folder": "dev/fastapi", "terms": ["BackgroundTasks"]},
+    {"query": "OVMS OpenAI compatible chat completions endpoint", "folder": "ai/ovms", "terms": ["chat/completions", "OpenAI"]},
+    {"query": "OVMS pull a model from Hugging Face", "folder": "ai/ovms", "terms": ["pull", "Hugging Face"]},
+    {"query": "OVMS model repository configuration", "folder": "ai/ovms", "terms": ["models_repository", "config.json"]},
+    {"query": "OVMS metrics endpoint and Prometheus", "folder": "ai/ovms", "terms": ["metrics", "Prometheus"]},
+    {"query": "OpenVINO GenAI continuous batching", "folder": "ai/openvino-genai", "terms": ["continuous batching"]},
+    {"query": "OpenVINO GenAI speculative decoding", "folder": "ai/openvino-genai", "terms": ["speculative decoding"]},
+    {"query": "OpenVINO GenAI prefix caching", "folder": "ai/openvino-genai", "terms": ["prefix caching"]},
+    {"query": "Qwen3 thinking budget", "folder": "ai/qwen3", "terms": ["thinking budget"]},
+    {"query": "Qwen3 function calling tool use", "folder": "ai/qwen3", "terms": ["function call"]},
+    {"query": "Qwen3 quickstart vLLM deployment", "folder": "ai/qwen3", "terms": ["vllm"]},
+    {"query": "pypdfium2 render a page to a PIL image", "folder": "dev/pdfium", "terms": ["render", "PIL"]},
+    {"query": "pypdfium2 Python API PdfBitmap", "folder": "dev/pdfium", "terms": ["PdfBitmap", "bitmap"]},
+    {"query": "SQLite FTS5 bm25 ranking function", "folder": "dev/sqlite", "terms": ["bm25"]},
+    {"query": "SQLite FTS5 external content table", "folder": "dev/sqlite", "terms": ["external content"]},
+    {"query": "SQLite write-ahead logging WAL mode", "folder": "dev/sqlite", "terms": ["WAL", "write-ahead"]},
+    {"query": "Python sqlite3 connection context manager commit", "folder": "dev/python", "terms": ["context manager", "commit"]},
+    {"query": "Python contextlib contextmanager decorator", "folder": "dev/python", "terms": ["contextmanager"]},
+    {"query": "Python asyncio create_task and gather", "folder": "dev/python", "terms": ["create_task", "gather"]}
+  ],
+  "negative": [
+    "quantum chromodynamics lattice spacing renormalisation",
+    "how to bake a chocolate souffle at high altitude",
+    "medieval French poetry rhyme schemes"
+  ]
+}

@@ -3,8 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from aiolocal.config import Paths, Settings, SettingsStore
-from aiolocal.models import CATALOG, GRAPH_TEMPLATE, ModelManager
+from aiolocal.models import (
+    CATALOG,
+    GRAPH_TEMPLATE,
+    ModelManager,
+    inspect_ov_folder,
+    parse_hf_repo,
+)
 
 
 def make_manager(tmp_path: Path) -> ModelManager:
@@ -116,3 +124,152 @@ def test_lfm_defaults_to_cpu_with_npu_fallback():
     assert entry["default_device"] == "CPU"
     assert entry["devices"][0] == "CPU"
     assert "CPU" in entry["fallback_devices"]
+
+
+def make_custom_folder(
+    manager: ModelManager,
+    name: str,
+    *,
+    config: dict | None = None,
+    model_index: dict | None = None,
+    xml: str = "openvino_model",
+    graph: bool = True,
+) -> Path:
+    directory = manager.models_root() / name
+    directory.mkdir(parents=True)
+    (directory / f"{xml}.xml").write_text("<net/>", encoding="utf-8")
+    (directory / f"{xml}.bin").write_bytes(b"0" * 2_000_000)
+    (directory / "config.json").write_text(json.dumps(config or {}), encoding="utf-8")
+    if model_index is not None:
+        (directory / "model_index.json").write_text(json.dumps(model_index), encoding="utf-8")
+    if graph:
+        (directory / "graph.pbtxt").write_text(GRAPH_TEMPLATE, encoding="utf-8")
+    return directory
+
+
+def test_inspect_ov_folder_rejects_non_openvino_weights(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    folder = manager.models_root() / "gguf-model"
+    folder.mkdir(parents=True)
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    (folder / "model.gguf").write_bytes(b"0" * 1024)
+
+    info = inspect_ov_folder(folder)
+
+    assert info["ok"] is False
+    assert "OpenVINO IR" in info["reason"]
+    assert "not supported" in info["reason"]
+
+
+def test_inspect_ov_folder_requires_metadata(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    folder = manager.models_root() / "bare-ir"
+    folder.mkdir(parents=True)
+    (folder / "openvino_model.xml").write_text("<net/>", encoding="utf-8")
+    (folder / "openvino_model.bin").write_bytes(b"0" * 1024)
+
+    info = inspect_ov_folder(folder)
+
+    assert info["ok"] is False
+    assert "config.json" in info["reason"]
+
+
+def test_inspect_ov_folder_detects_text_embedding_and_image(tmp_path: Path):
+    manager = make_manager(tmp_path)
+
+    text = make_custom_folder(manager, "custom-text", config={"max_position_embeddings": 16384})
+    embedding = make_custom_folder(manager, "bge-embedding", config={"model_type": "embedding"})
+    image = make_custom_folder(manager, "sd-custom", model_index={"_class_name": "StableDiffusionPipeline"})
+
+    text_info = inspect_ov_folder(text)
+    assert text_info["ok"] is True
+    assert text_info["task"] == "text_generation"
+    assert text_info["context"] == 16384
+
+    embed_info = inspect_ov_folder(embedding)
+    assert embed_info["ok"] is True
+    assert embed_info["task"] == "embeddings"
+
+    image_info = inspect_ov_folder(image)
+    assert image_info["ok"] is True
+    assert image_info["task"] == "image_generation"
+
+
+def test_parse_hf_repo_accepts_urls_and_rejects_other_hosts():
+    assert parse_hf_repo("https://huggingface.co/OpenVINO/Qwen3-4B-Instruct-2507-int4-cw-ov") == (
+        "OpenVINO/Qwen3-4B-Instruct-2507-int4-cw-ov"
+    )
+    assert parse_hf_repo("OpenVINO/Qwen3-4B-Instruct-2507-int4-cw-ov") == (
+        "OpenVINO/Qwen3-4B-Instruct-2507-int4-cw-ov"
+    )
+    with pytest.raises(ValueError, match="huggingface.co"):
+        parse_hf_repo("https://example.com/OpenVINO/model")
+    with pytest.raises(ValueError, match="organisation"):
+        parse_hf_repo("https://huggingface.co/only-a-name")
+
+
+def test_scan_registers_pending_model_once(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    make_custom_folder(manager, "detected-model")
+
+    fresh = manager.scan_custom_models(force=True)
+
+    assert len(fresh) == 1
+    assert fresh[0]["folder"] == "detected-model"
+    assert fresh[0]["role_status"] == "pending"
+    assert [m["id"] for m in manager.pending_entries()] == [fresh[0]["id"]]
+
+    # A second scan sees the same folder and does not register a duplicate.
+    assert manager.scan_custom_models(force=True) == []
+    assert len(manager.entries()) == len(CATALOG) + 1
+
+    # A non-OpenVINO folder is ignored and explained.
+    broken = manager.models_root() / "not-openvino"
+    broken.mkdir(parents=True)
+    (broken / "model.onnx").write_bytes(b"0")
+    manager.scan_custom_models(force=True)
+    assert "not-openvino" in manager._scan_ignored
+
+
+def test_assign_role_configures_chat_settings(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    make_custom_folder(manager, "custom-chat")
+    entry = manager.scan_custom_models(force=True)[0]
+
+    result = manager.assign_role(entry["id"], "chat", device="CPU")
+
+    assert result["ok"] is True
+    assert result["role"] == "chat"
+    assert result["device"] == "CPU"
+    settings = manager.settings_store.load()
+    assert settings.chat_model == entry["id"]
+    assert entry["id"] in settings.auto_load
+    stored = manager.custom_entry(entry["id"])
+    assert stored is not None
+    assert stored["role_status"] == "assigned"
+    assert stored["role_key"] == "chat"
+    assert manager.status()["models"][-1]["custom"] is True
+
+
+def test_assign_image_editing_role_sets_edit_model(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    make_custom_folder(
+        manager,
+        "inpaint-custom",
+        model_index={"_class_name": "StableDiffusionInpaintPipeline"},
+    )
+    entry = manager.scan_custom_models(force=True)[0]
+
+    result = manager.assign_role(entry["id"], "inpaint")
+
+    assert result["role"] == "image_edit"
+    settings = manager.settings_store.load()
+    assert settings.image_edit_model == entry["id"]
+    assert settings.image_model != entry["id"]
+
+
+def test_assign_role_rejects_unknown_custom_model(tmp_path: Path):
+    manager = make_manager(tmp_path)
+
+    with pytest.raises(ValueError, match="not a custom model"):
+        manager.assign_role("qwen3.5-9b", "chat")

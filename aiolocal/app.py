@@ -114,7 +114,12 @@ def create_app(
         web_search = WebSearch(settings, secrets)
         # OpenCode talks to this app's gateway, not directly to OVMS: it must go
         # through memory, knowledge opt-in and web-safety handling.
-        code_ws = CodeWorkspace(paths, settings_store, base_url=f"http://127.0.0.1:{port}")
+        code_ws = CodeWorkspace(
+        paths,
+        settings_store,
+        base_url=f"http://127.0.0.1:{port}",
+        model_manager=models,
+    )
         reverse = ReverseEngineering(settings_store, paths)
 
         def lookup_image(image_id: str):

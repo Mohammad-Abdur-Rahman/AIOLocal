@@ -34,6 +34,16 @@ listed just as plainly.
   provenance and licence metadata; `tools/kb_eval.py` verifies routing, chunk retrieval and
   negative controls (385 documents / 6,072 chunks: 100% folder hit@3, 100% chunk hit@5,
   100% negative control on this machine).
+- **Document jobs are one page per call, always.** The saved settings cannot reintroduce
+  batching or a page cap; old `app.json` files are migrated once. After a job is cancelled or
+  fails, the progress bar can be dismissed instead of staying on screen.
+- **Memory counts match reality.** The chat badge now says "memory items" and its tooltip
+  explains the split between summary rows and the exact page/section/history excerpts that
+  were injected but are not listed as summaries in the Memory view.
+- **Custom OpenVINO models can be imported.** Add a Hugging Face repository URL or copy an
+  OpenVINO IR folder into the models directory. The app scans on startup, prompts for a role
+  (chat, memory summary, embedding, image generation or image editing), then configures the
+  matching settings, OVMS config, dropdowns and `opencode.json` exactly like a built-in model.
 
 ---
 
@@ -51,6 +61,7 @@ listed just as plainly.
 | Token-budgeted prompt assembly with the documented trim order | ✅ |
 | Memory Inspector (see exactly what the model saw) | ✅ |
 | Model catalog, device choice, load/unload via OVMS config reload | ✅ |
+| Custom OpenVINO IR import (Hugging Face URL or local folder) with role-based auto-configuration | ✅ |
 | Image generation/edit proxy + local gallery | ✅ |
 | Image attachments to a vision chat model (Qwen3-VL 4B) | ✅ |
 | PDF chat attachments: every page rendered and analysed one page per vision call, grouped into section memory and resumable jobs | ✅ |
@@ -148,10 +159,15 @@ Then:
 
 1. Open **Models**, download a model, choose a device and press **Load**. Model weights are
    the only large downloads you choose explicitly; they are never bundled.
-2. Press **Start**. The app writes the OVMS config itself, reproduces OVMS's `setupvars`
+2. To add a model that is not in the catalog, paste a Hugging Face URL in **Custom OpenVINO
+   models** or copy its folder into the models directory. Only OpenVINO IR layouts are
+   accepted (`.xml` + `.bin` plus `config.json`, `openvino_config.json`, `model_index.json` or
+   `graph.pbtxt`); ONNX, GGUF and SafeTensors are rejected. Choose its role and the app wires
+   up Chat/OpenCode, memory summaries, embeddings, or image generation/editing.
+3. Press **Start**. The app writes the OVMS config itself, reproduces OVMS's `setupvars`
    environment (its bundled Python backend needs `PYTHONHOME`/`PATH`), and shows a live
    startup status with the log tail if anything fails.
-3. Model downloads show real byte progress; server startup shows an indeterminate progress
+4. Model downloads show real byte progress; server startup shows an indeterminate progress
    bar plus the current stage (starting → loading model → ready).
 
 The previous build wrote a config with a `task` key, which OVMS 2026 rejects, and launched

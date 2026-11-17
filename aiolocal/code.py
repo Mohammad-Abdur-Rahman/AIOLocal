@@ -73,10 +73,17 @@ def _b64url(text: str) -> str:
 
 
 class CodeWorkspace:
-    def __init__(self, paths: Paths, settings_store: SettingsStore, base_url: str) -> None:
+    def __init__(
+        self,
+        paths: Paths,
+        settings_store: SettingsStore,
+        base_url: str,
+        model_manager=None,
+    ) -> None:
         self.paths = paths
         self.settings_store = settings_store
         self.base_url = base_url.rstrip("/")
+        self.model_manager = model_manager
         self._lock = threading.RLock()
         self._process: subprocess.Popen | None = None
         self._log = None
@@ -539,12 +546,18 @@ class CodeWorkspace:
         }
 
     def _models(self, settings) -> list[dict]:
-        from .models import CATALOG
+        if self.model_manager is not None:
+            entries = self.model_manager.entries()
+        else:
+            from .models import CATALOG
+
+            entries = CATALOG
 
         return [
             {"id": m["id"], "name": m["name"]}
-            for m in CATALOG
-            if m["task"] == "text_generation"
+            for m in entries
+            if m.get("task") == "text_generation"
+            and m.get("role_status", "assigned") == "assigned"
         ]
 
     # ------------------------------------------------------------------ provider config

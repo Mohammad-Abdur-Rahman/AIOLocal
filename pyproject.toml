@@ -26,7 +26,7 @@ dependencies = [
   "huggingface-hub>=0.27,<2",
   "pypdf>=5,<8",
   "pypdfium2>=4.30,<6",
-  "Pillow>=10,<12",
+  "Pillow>=13,<14",
 ]
 
 [project.optional-dependencies]

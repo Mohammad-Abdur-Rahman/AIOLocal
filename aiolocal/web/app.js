@@ -27,6 +27,8 @@
     logTimer: null,
     codeEmbedUrl: "",
     codeEmbedBusy: false,
+    promptedCustom: new Set(),
+    customPromptOpen: false,
   };
 
   const PLANNED = {
@@ -65,6 +67,23 @@
         year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit",
       });
     } catch { return ""; }
+  }
+
+  function memoryKindLabel(kind) {
+    return {
+      summary: "summary rows",
+      document_page: "page excerpts",
+      document_section: "section summaries",
+      exact: "exact excerpts",
+      history: "history excerpts",
+    }[kind] || String(kind || "memory items").replace(/_/g, " ");
+  }
+
+  function memoryBreakdownText(breakdown) {
+    const parts = Object.entries(breakdown || {})
+      .filter(([, count]) => Number(count) > 0)
+      .map(([kind, count]) => `${count} ${memoryKindLabel(kind)}`);
+    return parts.length ? `Includes ${parts.join(", ")}.` : "";
   }
 
   function toast(message, isError = false) {
@@ -310,6 +329,7 @@
       applyPills(payload);
       populateChatModels();
       populateImageModels();
+      maybePromptPending(state.models);
       if (state.view === "memory") renderMemoryStats();
       if (state.view === "models") renderModels();
       if (state.view === "settings") fillSettings();
@@ -459,37 +479,58 @@
     const select = $("#chat-model");
     if (!select) return;
     const models = ((state.models && state.models.models) || []).filter(
-      (model) => model.task === "text_generation"
+      (model) => model.task === "text_generation" &&
+        (model.role_status === undefined || model.role_status === "assigned")
     );
-    const current = select.value || (state.settings && state.settings.chat_model) || "";
+    const preferred = (state.settings && state.settings.chat_model) || "";
+    // Switch to a newly configured chat model, but keep a manual per-chat choice
+    // when the saved default has not changed.
+    const previousDefault = select.dataset.settingsModel || "";
+    const current = (preferred && preferred !== previousDefault)
+      ? preferred
+      : (select.value || preferred);
+    select.dataset.settingsModel = preferred;
     if (!models.length) {
       select.innerHTML = `<option value="${escapeAttr(current)}">${escapeHtml(current || "no model")}</option>`;
       return;
     }
     select.innerHTML = models.map((model) => {
-      const tags = [model.vision ? "vision" : "", model.loaded ? "loaded" : ""].filter(Boolean).join(" · ");
+      const tags = [model.vision ? "vision" : "", model.loaded ? "loaded" : "", model.custom ? "custom" : ""]
+        .filter(Boolean).join(" · ");
       return `<option value="${escapeAttr(model.id)}" ${model.id === current ? "selected" : ""}>` +
         `${escapeHtml(model.name || model.id)}${tags ? " · " + escapeHtml(tags) : ""}</option>`;
     }).join("");
     if (!select.value && current) select.value = current;
   }
 
+  function imageRoleOf(model) {
+    const key = String(model.role_key || "");
+    if (key === "image" || key === "image_edit") return key;
+    const blob = `${model.id || ""} ${model.role || ""}`.toLowerCase();
+    return /inpaint|editing/.test(blob) ? "image_edit" : "image";
+  }
+
   function populateImageModels() {
     const models = ((state.models && state.models.models) || []).filter(
-      (model) => model.task === "image_generation"
+      (model) => model.task === "image_generation" &&
+        (model.role_status === undefined || model.role_status === "assigned")
     );
-    const ids = models.map((model) => model.id);
-    const choose = (select, fallback) => {
+    const settings = state.settings || {};
+    const choose = (select, fallback, wanted) => {
       if (!select) return;
-      const current = select.value || fallback;
+      const ids = models.filter((model) => imageRoleOf(model) === wanted).map((model) => model.id);
+      const preferred = wanted === "image_edit" ? settings.image_edit_model : settings.image_model;
       const options = ids.length ? ids : [fallback];
+      const current = (preferred && options.includes(preferred))
+        ? preferred
+        : (select.value && options.includes(select.value) ? select.value : options[0]);
       select.innerHTML = options.map((id) =>
         `<option value="${escapeAttr(id)}" ${id === current ? "selected" : ""}>${escapeHtml(id)}</option>`
       ).join("");
-      if (!select.value) select.value = fallback;
+      select.value = current;
     };
-    choose($("#img-model"), "sd15");
-    choose($("#img-edit-model"), "sd15-inpaint");
+    choose($("#img-model"), "sd15", "image");
+    choose($("#img-edit-model"), "sd15-inpaint", "image_edit");
   }
 
   function clearChatImage() {
@@ -624,6 +665,7 @@
     let answer = "";
     let requestId = "";
     let memoryCount = 0;
+    let memoryBreakdown = {};
     let finished = false;
     const headers = {
       "Content-Type": "application/json",
@@ -643,6 +685,9 @@
 
       requestId = res.headers.get("X-AIO-Request-Id") || "";
       memoryCount = parseInt(res.headers.get("X-AIO-Memory-Items") || "0", 10) || 0;
+      try {
+        memoryBreakdown = JSON.parse(res.headers.get("X-AIO-Memory-Breakdown") || "{}") || {};
+      } catch { memoryBreakdown = {}; }
 
       if (!res.ok) {
         let message = `Request failed (HTTP ${res.status})`;
@@ -695,7 +740,13 @@
       setAssistantContent(assistant, answer || "_No response._");
       const badges = [];
       if (memoryCount > 0 && requestId) {
-        badges.push(`<button class="badge button" data-inspect="${escapeAttr(requestId)}">${memoryCount} memories used</button>`);
+        const detail = memoryBreakdownText(memoryBreakdown);
+        const label = memoryCount === 1 ? "memory item" : "memory items";
+        badges.push(
+          `<button class="badge button" data-inspect="${escapeAttr(requestId)}" ` +
+          `title="${escapeAttr(detail || "Memory items include exact excerpts and summary rows.")}">` +
+          `${memoryCount} ${label}</button>`
+        );
       } else if (finished) {
         badges.push('<span class="badge">no memory used</span>');
       }
@@ -723,7 +774,7 @@
     $("#chat-doc-bar").style.width = `${pct}%`;
     const stateText = {
       queued: "Queued…",
-      running: `Reading pages ${done}/${total || "?"} — batch ${job.batches_done || 0}/${job.batches_total || "?"}`,
+      running: `Reading page ${Math.min(done + 1, total || done + 1)} of ${total || "?"}`,
       done: "Saved to memory.",
       error: `Failed: ${job.error || "unknown error"}`,
       cancelled: "Cancelled. Finished pages are kept.",
@@ -734,6 +785,22 @@
     if (cancel) {
       cancel.classList.toggle("hidden", !["queued", "running"].includes(job.state));
     }
+    const hide = $("#chat-doc-hide");
+    if (hide) {
+      hide.classList.toggle(
+        "hidden",
+        !["cancelled", "error", "interrupted", "done"].includes(job.state)
+      );
+    }
+  }
+
+  function hideDocumentJob() {
+    stopDocumentPolling();
+    state.chatDocJob = null;
+    const box = $("#chat-doc-job");
+    if (box) box.classList.add("hidden");
+    const bar = $("#chat-doc-bar");
+    if (bar) bar.style.width = "0%";
   }
 
   async function cancelDocumentJob() {
@@ -1106,6 +1173,14 @@
       }).join("");
 
       const items = plan.selected || (plan.retrieval && plan.retrieval.selected) || [];
+      const breakdown = items.reduce((acc, item) => {
+        const kind = String(item.kind || "memory");
+        acc[kind] = (acc[kind] || 0) + 1;
+        return acc;
+      }, {});
+      const breakdownBadges = Object.entries(breakdown)
+        .map(([kind, count]) => `<span class="badge">${count} ${escapeHtml(memoryKindLabel(kind))}</span>`)
+        .join(" ");
       const itemRows = items.map((i) => `
         <div class="result">
           <div class="result-head"><span class="badge">${escapeHtml(i.kind)}</span>
@@ -1120,6 +1195,8 @@
         <p class="muted small">request ${escapeHtml(requestId)} · retrieval ${retrieval.latency_ms || 0} ms${trimmed ? " · trimmed: " + escapeHtml((assembly.trims || []).join(", ")) : ""}</p>
         <div class="bars">${bars}</div>
         <h2 style="margin-top:16px">Retrieved memory</h2>
+        ${breakdownBadges ? `<p>${breakdownBadges}</p>` : ""}
+        <p class="muted small">Exact excerpts (document pages, sections and history) are injected for this answer but are not summary rows in the Memory view. The Memory view lists durable summaries only, so its count can be lower than the number of items here.</p>
         ${itemRows}
         <details style="margin-top:14px"><summary class="muted small">Raw plan</summary>
           <pre class="json">${escapeHtml(JSON.stringify(plan, null, 2))}</pre>
@@ -1139,6 +1216,214 @@
     let v = n;
     while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
     return `${v.toFixed(i > 1 ? 1 : 0)} ${units[i]}`;
+  }
+
+  const CUSTOM_ROLES = [
+    ["chat", "Main chat model (Chat, OpenCode, REA)"],
+    ["filing", "Memory summary management"],
+    ["embedding", "Embedding management"],
+    ["image", "Image generation"],
+    ["image_edit", "Image editing / inpainting"],
+  ];
+
+  function customRoleOptions(selected = "") {
+    return CUSTOM_ROLES.map(([value, label]) =>
+      `<option value="${escapeAttr(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(label)}</option>`
+    ).join("");
+  }
+
+  function pendingModelControls(pending) {
+    return pending.map((model) => `
+      <div class="model-card" data-custom-row="${escapeAttr(model.id)}">
+        <div class="model-head">
+          <div>
+            <div class="model-name">${escapeHtml(model.name || model.id)}</div>
+            <div class="model-repo">${escapeHtml(model.folder || model.path || model.repo || "")}</div>
+          </div>
+          <span class="tag warn">role needed</span>
+        </div>
+        <div class="model-desc">
+          Detected a ${escapeHtml(model.detected_kind || "custom")} OpenVINO IR model.
+          Choose what this model is for. The app will configure the matching module for you.
+        </div>
+        <div class="model-actions wrap">
+          <select data-custom-role="${escapeAttr(model.id)}">${customRoleOptions(
+            model.detected_kind === "image" ? (model.edit_hint ? "image_edit" : "image")
+              : model.detected_kind === "embeddings" ? "embedding" : "chat"
+          )}</select>
+          <label class="check"><input type="checkbox" data-custom-vision="${escapeAttr(model.id)}" ${model.vision ? "checked" : ""}> Image input (vision)</label>
+          <button class="btn primary small" type="button" data-custom-assign="${escapeAttr(model.id)}">Use this model</button>
+        </div>
+      </div>`).join("");
+  }
+
+  function renderCustomModels(data) {
+    const status = $("#custom-model-status");
+    if (!status) return;
+    const pending = data.pending_models || [];
+    const pulls = data.custom_pulls || [];
+    const activePull = pulls.find((item) => ["starting", "running"].includes(item.state));
+    const failedPull = pulls.find((item) => item.state === "failed");
+    const ignored = Object.keys(data.ignored_folders || {}).length;
+    status.textContent =
+      `Models folder: ${data.models_dir || ""}` +
+      (ignored ? ` · ${ignored} folder${ignored === 1 ? "" : "s"} ignored (not OpenVINO IR)` : "");
+
+    const progress = $("#custom-model-progress");
+    if (progress) {
+      progress.classList.toggle("hidden", !activePull);
+      if (activePull) {
+        const pct = Math.max(4, Math.min(99, Number(activePull.percent || 0)));
+        $("#custom-model-progress-label").textContent =
+          `Downloading ${activePull.repo || activePull.model}`;
+        $("#custom-model-progress-size").textContent =
+          `${fmtBytes(activePull.downloaded)} / ${fmtBytes(activePull.total)}`;
+        $("#custom-model-bar").style.width = `${pct}%`;
+      }
+    }
+    if (failedPull) {
+      status.textContent += ` · download failed: ${failedPull.error || failedPull.model}`;
+    }
+
+    const pendingBox = $("#pending-models");
+    if (pendingBox) {
+      pendingBox.innerHTML = pending.length
+        ? `<h3>New models need a role</h3>${pendingModelControls(pending)}`
+        : "";
+    }
+    const list = $("#custom-model-list");
+    if (list) {
+      const assigned = (data.custom_models || []).filter((m) => m.role_status === "assigned");
+      list.innerHTML = assigned.length
+        ? `<h3>Custom models</h3>` + assigned.map((m) => `
+            <div class="model-card">
+              <div class="model-head">
+                <div>
+                  <div class="model-name">${escapeHtml(m.name || m.id)}</div>
+                  <div class="model-repo">${escapeHtml(m.folder || m.repo || "")}</div>
+                </div>
+                <span class="tag">${escapeHtml(m.role || "custom")}</span>
+              </div>
+              <div class="model-actions">
+                <span class="muted small">${escapeHtml(m.path || "")}</span>
+                <button class="btn ghost small" type="button" data-custom-remove="${escapeAttr(m.id)}">Remove from list</button>
+              </div>
+            </div>`).join("")
+        : "";
+    }
+  }
+
+  function maybePromptPending(data) {
+    const pending = (data && data.pending_models) || [];
+    if (!pending.length) return;
+    const fresh = pending.filter((model) => !state.promptedCustom.has(model.id));
+    pending.forEach((model) => state.promptedCustom.add(model.id));
+    if (!fresh.length || state.customPromptOpen) return;
+    if (!$("#modal").classList.contains("hidden")) return;
+    state.customPromptOpen = true;
+    openModal(`
+      <h2>New OpenVINO model found</h2>
+      <p class="muted small">The models folder contains ${fresh.length === 1 ? "a model" : "models"} that the app has not configured yet. Choose a role and the matching settings, dropdowns and OpenCode config are updated automatically.</p>
+      ${pendingModelControls(fresh)}
+      <p class="muted small">Only OpenVINO IR folders are listed. NNCF fine-tuning and quantization are planned for a later version.</p>
+    `);
+  }
+
+  function findCustomRow(id) {
+    return Array.from(document.querySelectorAll("[data-custom-row]"))
+      .find((row) => row.dataset.customRow === id) || null;
+  }
+
+  async function assignCustomModel(id, button) {
+    const row = button ? button.closest("[data-custom-row]") : findCustomRow(id);
+    const roleSelect = row ? row.querySelector("[data-custom-role]") : null;
+    const visionBox = row ? row.querySelector("[data-custom-vision]") : null;
+    const role = roleSelect ? roleSelect.value : "chat";
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/models/custom/assign", {
+        method: "POST",
+        body: { model: id, role, vision: visionBox ? visionBox.checked : undefined },
+      });
+      state.settings = result.settings || state.settings;
+      const target = result.role === "chat" ? "Chat, OpenCode and REA"
+        : result.role === "filing" ? "memory summaries"
+        : result.role === "embedding" ? "embeddings"
+        : result.role === "image_edit" ? "image editing" : "image generation";
+      let message = `${id} is now the ${result.role_label || role} (${target}).`;
+      if (result.reload && !result.reload.ok) {
+        message += ` OVMS did not reload yet: ${result.reload.message}`;
+      }
+      if (result.opencode_config) message += ` OpenCode config: ${result.opencode_config}.`;
+      if (result.embedding_needs_reembed) {
+        message += " Use Re-embed in Memory to rebuild old vectors.";
+      }
+      $("#custom-model-status").textContent = message;
+      toast(message, !!(result.reload && !result.reload.ok));
+      if (row && row.closest("#modal-body")) {
+        state.customPromptOpen = false;
+        closeModal();
+      }
+      await refreshModels();
+      await refreshState();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function scanCustomModels() {
+    const button = $("#custom-model-scan");
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/models/custom/scan", { method: "POST" });
+      const count = (result.new || []).length;
+      toast(count
+        ? `Found ${count} new OpenVINO model${count === 1 ? "" : "s"}. Choose a role for each.`
+        : "No new OpenVINO models were found.");
+      await refreshModels();
+      await refreshState();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function downloadCustomModel() {
+    const input = $("#custom-model-url");
+    const button = $("#custom-model-download");
+    const url = input ? input.value.trim() : "";
+    if (!url) {
+      toast("Enter a Hugging Face repository URL.", true);
+      return;
+    }
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/models/custom/download", { method: "POST", body: { url } });
+      toast(result.already_detected || result.already_installed
+        ? "That model is already in the models folder."
+        : `Download started for ${result.repo || result.model}.`);
+      if (input) input.value = "";
+      await refreshModels();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function removeCustomModel(id) {
+    try {
+      await api("/models/custom/remove", { method: "POST", body: { model: id } });
+      toast(`${id} removed from the model list. The folder was kept.`);
+      state.promptedCustom.delete(id);
+      await refreshModels();
+      await refreshState();
+    } catch (err) {
+      toast(err.message, true);
+    }
   }
 
   function renderModels() {
@@ -1188,7 +1473,9 @@
     $("#ovms-stop").disabled = ovmsState === "stopped" || ovmsState === "error";
 
     const list = $("#model-list");
-    list.innerHTML = (data.models || []).map((m) => {
+    list.innerHTML = (data.models || []).filter(
+      (m) => !m.custom || m.role_status === "assigned"
+    ).map((m) => {
       const tags = [
         m.installed ? '<span class="tag ok">installed</span>' : '<span class="tag">not downloaded</span>',
         m.loaded ? '<span class="tag ok">loaded</span>' : "",
@@ -1243,6 +1530,8 @@
         </div>`;
     }).join("");
 
+    renderCustomModels(data);
+    maybePromptPending(data);
     ensureModelPolling(data);
   }
 
@@ -1250,7 +1539,8 @@
     const active = !!data && (
       data.ovms_state === "starting" ||
       data.ovms_state === "loading" ||
-      (data.models || []).some((m) => m.pulling)
+      (data.models || []).some((m) => m.pulling) ||
+      (data.custom_pulls || []).some((p) => ["starting", "running"].includes(p.state))
     );
     if (active && !modelsTimer) {
       modelsTimer = setInterval(refreshModels, 1500);
@@ -2203,6 +2493,18 @@
   }
 
   /* ------------------------------------------------------------ settings */
+  async function saveImageChoice(field, value) {
+    if (!value) return;
+    try {
+      const result = await api("/settings", { method: "PUT", body: { [field]: value } });
+      state.settings = result.settings;
+      toast(`${field === "image_edit_model" ? "Editing" : "Image"} model set to ${value}.`);
+      refreshState();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
   function fillSettings() {
     const s = state.settings;
     if (!s) return;
@@ -2290,6 +2592,7 @@
   function closeModal() {
     $("#modal").classList.add("hidden");
     $("#modal-body").innerHTML = "";
+    state.customPromptOpen = false;
   }
 
   /* ------------------------------------------------------------ events */
@@ -2390,6 +2693,7 @@
     $("#chat-attachment-remove").addEventListener("click", clearChatImage);
     $("#chat-add-document").addEventListener("click", () => $("#chat-document-input").click());
     $("#chat-doc-cancel").addEventListener("click", cancelDocumentJob);
+    $("#chat-doc-hide").addEventListener("click", hideDocumentJob);
     $("#chat-document-input").addEventListener("change", (event) => {
       const file = event.target.files && event.target.files[0];
       if (file) startDocumentAnalysis(file);
@@ -2467,6 +2771,28 @@
       const unload = event.target.closest("[data-unload]");
       if (unload) unloadModel(unload.dataset.unload);
     });
+    $("#custom-model-download").addEventListener("click", downloadCustomModel);
+    $("#custom-model-scan").addEventListener("click", scanCustomModels);
+    $("#custom-model-url").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        downloadCustomModel();
+      }
+    });
+    const customActions = (event) => {
+      const assign = event.target.closest("[data-custom-assign]");
+      if (assign) {
+        assignCustomModel(assign.dataset.customAssign, assign);
+        return;
+      }
+      const remove = event.target.closest("[data-custom-remove]");
+      if (remove) removeCustomModel(remove.dataset.customRemove);
+    };
+    $("#pending-models").addEventListener("click", customActions);
+    $("#custom-model-list").addEventListener("click", customActions);
+    $("#modal-body").addEventListener("click", customActions);
+    $("#img-model").addEventListener("change", () => saveImageChoice("image_model", $("#img-model").value));
+    $("#img-edit-model").addEventListener("change", () => saveImageChoice("image_edit_model", $("#img-edit-model").value));
     $("#ovms-start").addEventListener("click", async () => {
       try {
         const r = await api("/ovms/start", { method: "POST" });
@@ -2577,6 +2903,9 @@
       state.models = payload.models;
       state.paths = payload.paths;
       applyPills(payload);
+      populateChatModels();
+      populateImageModels();
+      maybePromptPending(state.models);
     } catch (err) {
       toast(err.message, true);
     }

@@ -38,7 +38,7 @@ from .llm import api_url
 from .memory import store
 from .memory import semantic
 from .memory.text import embed, estimate_tokens, new_id
-from .models import CATALOG
+from .models import CATALOG, load_custom_models
 
 VISION_SYSTEM = (
     "You are the document indexing engine of a local AI workspace. You read PDF "
@@ -313,13 +313,9 @@ class DocumentAnalyzer:
                 pdf.close()
             if total <= 0:
                 raise DocumentError("this PDF has no pages")
-            cap = int(settings.document_max_pages or 0)
-            job.pages_total = total if cap <= 0 else min(total, cap)
-            if cap > 0 and total > cap:
-                job.error = (
-                    f"only the first {cap} of {total} pages were analysed; "
-                    "set document_max_pages to 0 for the whole document"
-                )
+            # Every page is analysed. There is deliberately no page cap: a large
+            # document is resumable, so stopping at an arbitrary page loses value.
+            job.pages_total = total
         except DocumentError as exc:
             self._fail(job, str(exc))
             return
@@ -327,8 +323,9 @@ class DocumentAnalyzer:
             self._fail(job, f"could not open the PDF ({type(exc).__name__}: {exc})")
             return
 
-        step = max(1, int(settings.document_pages_per_batch or 1))
-        job.batches_total = (job.pages_total + step - 1) // step
+        # One page per vision call is the accuracy setting, not a preference.
+        step = 1
+        job.batches_total = job.pages_total
         if job.state != "running":
             job.state = "running"
         self._save_job(job)
@@ -685,10 +682,11 @@ class DocumentAnalyzer:
     # ------------------------------------------------------------------ helpers
     def _vision_model(self, settings: Settings) -> str:
         preferred = str(settings.chat_model or "").strip()
-        for entry in CATALOG:
+        entries = [*CATALOG, *load_custom_models(self.paths)]
+        for entry in entries:
             if entry["id"] == preferred and entry.get("vision") and entry.get("task") == "text_generation":
                 return preferred
-        for entry in CATALOG:
+        for entry in entries:
             if entry.get("vision") and entry.get("task") == "text_generation":
                 return entry["id"]
         return ""

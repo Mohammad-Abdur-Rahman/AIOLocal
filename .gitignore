@@ -46,6 +46,10 @@ REPORT*.txt
 Report*.txt
 report*.txt
 
+# Local review artifacts
+/*.png
+depandabot reports/
+
 # OS / editors
 .DS_Store
 Thumbs.db

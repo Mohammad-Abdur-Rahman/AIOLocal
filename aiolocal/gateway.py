@@ -47,6 +47,24 @@ def _error(status: int, message: str, code: str, kind: str = "invalid_request_er
     )
 
 
+def _memory_headers(plan: dict) -> dict[str, str]:
+    """Count what actually entered the prompt, split by memory kind.
+
+    The badge used to say "N memories used" while the Memory view lists summary
+    rows only. Document page excerpts and chat history are memory items too, so
+    the count legitimately differs. A small breakdown makes that explicit.
+    """
+    items = plan.get("items") or []
+    counts: dict[str, int] = {}
+    for item in items:
+        kind = str((item or {}).get("kind") or "memory")
+        counts[kind] = counts.get(kind, 0) + 1
+    return {
+        "X-AIO-Memory-Items": str(len(items)),
+        "X-AIO-Memory-Breakdown": json.dumps(counts, separators=(",", ":")),
+    }
+
+
 def _apply_generation_defaults(ctx: AppContext, payload: dict) -> dict:
     """Apply local-model defaults without overriding explicit client choices.
 
@@ -559,7 +577,7 @@ async def chat_completions(request: Request):
             media_type="text/event-stream",
             headers={
                 **plan_headers(conversation_id, request_id),
-                "X-AIO-Memory-Items": str(len(plan.get("items") or [])),
+                **_memory_headers(plan),
                 "Cache-Control": "no-cache, no-transform",
                 "X-Accel-Buffering": "no",
             },
@@ -606,7 +624,7 @@ async def chat_completions(request: Request):
         content=data,
         headers={
             **plan_headers(conversation_id, request_id),
-            "X-AIO-Memory-Items": str(len(plan.get("items") or [])),
+            **_memory_headers(plan),
         },
     )
 

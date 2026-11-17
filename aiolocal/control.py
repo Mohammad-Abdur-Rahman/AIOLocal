@@ -24,7 +24,6 @@ from .db import now_ms
 from .llm import validate_base_url
 from .memory import store
 from .memory.retrieve import retrieve
-from .models import CATALOG
 from .security import valid_id
 
 router = APIRouter(prefix="/api/v1")
@@ -290,7 +289,7 @@ async def load_model(model_id: str, request: Request):
     except Exception:
         body = {}
     device = str((body or {}).get("device") or "").upper()
-    entry = next((m for m in CATALOG if m["id"] == model_id), None)
+    entry = ctx.models.entry(model_id)
     candidates = [device]
     if entry:
         for fallback in entry.get("fallback_devices") or []:
@@ -378,6 +377,113 @@ async def pull_model(model_id: str, request: Request):
         result = ctx.models.start_pull(model_id, publish=publish)
     except ValueError as exc:
         return _err(400, str(exc), "model_error")
+    return result
+
+
+# ------------------------------------------------------------------------- custom models
+@router.post("/models/custom/download")
+async def custom_model_download(request: Request):
+    ctx: AppContext = request.app.state.ctx
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    url = str((body or {}).get("url") or (body or {}).get("repo") or "").strip()
+    if not url:
+        return _err(400, "enter a Hugging Face repository URL", "invalid_repo")
+
+    def publish(kind: str, data: dict) -> None:
+        ctx.bus.publish(kind, data)
+
+    try:
+        result = ctx.models.start_custom_pull(url, publish=publish)
+    except ValueError as exc:
+        return _err(400, str(exc), "model_error")
+    return result
+
+
+@router.post("/models/custom/scan")
+async def custom_model_scan(request: Request):
+    ctx: AppContext = request.app.state.ctx
+    try:
+        fresh = ctx.models.scan_custom_models(force=True)
+    except Exception as exc:
+        return _err(500, f"could not scan the models folder: {exc}", "scan_error")
+    return {
+        "ok": True,
+        "new": fresh,
+        "pending": ctx.models.pending_entries(),
+        "models_dir": str(ctx.models.models_root()),
+    }
+
+
+@router.post("/models/custom/assign")
+async def custom_model_assign(request: Request):
+    ctx: AppContext = request.app.state.ctx
+    try:
+        body = await request.json()
+    except Exception:
+        return _err(400, "body must be JSON", "invalid_json")
+    if not isinstance(body, dict):
+        return _err(400, "body must be an object", "invalid_body")
+    model_id = str(body.get("model") or body.get("id") or "").strip()
+    role = str(body.get("role") or "").strip()
+    if not model_id or not role:
+        return _err(400, "model and role are required", "invalid_body")
+    try:
+        result = ctx.models.assign_role(
+            model_id,
+            role,
+            vision=body.get("vision") if isinstance(body.get("vision"), bool) else None,
+            device=str(body.get("device") or ""),
+        )
+    except ValueError as exc:
+        return _err(400, str(exc), "model_error")
+
+    from .config import Settings
+
+    try:
+        new_settings = Settings.from_dict(result.get("settings") or {})
+        ctx.update_settings(new_settings)
+    except (ValueError, TypeError) as exc:
+        return _err(400, f"model loaded but settings were invalid: {exc}", "invalid_settings")
+
+    if result.get("opencode_needs_reload") and ctx.code_ws is not None:
+        try:
+            result["opencode_config"] = str(ctx.code_ws.write_config())
+        except OSError as exc:
+            result["opencode_error"] = f"could not write the OpenCode config: {exc}"
+    if ctx.models.ovms_running():
+        ok, message = await ctx.models.reload(ctx.upstream)
+        result["reload"] = {"ok": ok, "message": message}
+    ctx.bus.publish("model_loaded", {"model": model_id, "role": result.get("role")})
+    ctx.bus.publish("settings_changed", {})
+    return result
+
+
+@router.post("/models/custom/remove")
+async def custom_model_remove(request: Request):
+    ctx: AppContext = request.app.state.ctx
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    model_id = str((body or {}).get("model") or "").strip()
+    if not model_id:
+        return _err(400, "model is required", "invalid_body")
+    try:
+        result = ctx.models.remove_custom(model_id)
+    except ValueError as exc:
+        return _err(400, str(exc), "model_error")
+    if ctx.code_ws is not None:
+        try:
+            ctx.code_ws.write_config()
+        except OSError:
+            pass
+    if ctx.models.ovms_running():
+        ok, message = await ctx.models.reload(ctx.upstream)
+        result["reload"] = {"ok": ok, "message": message}
+    ctx.bus.publish("settings_changed", {})
     return result
 
 
@@ -1198,7 +1304,7 @@ async def system_info(request: Request):
         "cpu_count": __import__("os").cpu_count(),
         "disk_free_gb": round(usage.free / (1024 ** 3), 1),
         "data_dir": str(ctx.paths.data_dir),
-        "catalog_size": len(CATALOG),
+        "catalog_size": len(ctx.models.entries()) if ctx.models else 0,
         "time": int(time.time()),
     }
 

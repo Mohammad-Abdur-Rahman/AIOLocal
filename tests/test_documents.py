@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -241,6 +242,63 @@ def test_only_pdf_files_are_accepted(tmp_path: Path):
     with pytest.raises(DocumentError, match="only PDF"):
         analyzer.start(text, "notes.txt")
     assert not text.exists()
+
+
+def test_saved_batch_and_cap_values_are_ignored(tmp_path: Path, monkeypatch):
+    analyzer, _, _ = make_analyzer(tmp_path)
+    pdf = make_pdf(tmp_path / "stale.pdf", pages=5)
+    calls: list[tuple[int, int]] = []
+
+    # Simulate an old app.json that still asks for 3 pages per call and a 2-page
+    # cap. Settings normally forces these fields, so tamper with the loaded object
+    # directly to prove documents.py cannot be talked into batching or stopping.
+    settings = analyzer.settings_store.load()
+    settings.document_pages_per_batch = 3
+    settings.document_max_pages = 2
+    monkeypatch.setattr(analyzer.settings_store, "load", lambda: settings)
+
+    analyzer._render_pages = lambda path, first, last, dpi: [b"page"] * (last - first + 1)
+
+    def vision(user_settings, model, title, first, last, images):
+        calls.append((first, last))
+        return f"Page {first}"
+
+    analyzer._vision_batch = vision
+    analyzer._consolidate = lambda job, user_settings, notes: "DONE"
+
+    job = analyzer.start(pdf, "stale.pdf")
+    current = wait_for(analyzer, job["id"])
+
+    assert current["state"] == "done", current
+    assert current["pages_total"] == 5
+    assert current["pages_done"] == 5
+    assert calls == [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+
+
+def test_old_settings_json_is_migrated_to_one_page_and_no_cap(tmp_path: Path):
+    paths = Paths.create(tmp_path / "data")
+    store = SettingsStore(paths)
+    store.path.write_text(
+        json.dumps(
+            {
+                "config_version": 1,
+                "chat_model": "qwen3.5-9b",
+                "document_pages_per_batch": 3,
+                "document_max_pages": 300,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = store.load()
+
+    assert settings.document_pages_per_batch == 1
+    assert settings.document_max_pages == 0
+    assert settings.config_version == 2
+    rewritten = json.loads(store.path.read_text(encoding="utf-8"))
+    assert rewritten["document_pages_per_batch"] == 1
+    assert rewritten["document_max_pages"] == 0
+    assert rewritten["config_version"] == 2
 
 
 def test_document_endpoint_streams_upload_and_finishes(env):

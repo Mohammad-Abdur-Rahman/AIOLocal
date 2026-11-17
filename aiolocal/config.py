@@ -104,10 +104,16 @@ class Settings:
     embedding_model: str = "qwen3-embedding-0.6b"
     embed_dim: int = 256
     # Document vision (PDF pages -> main vision model -> summary memory)
+    # Kept for old app.json files, but always one page per call and no page cap.
     document_pages_per_batch: int = 1
     document_dpi: int = 140
     document_max_pages: int = 0
     document_keep_pages: bool = False
+    # Explicit image roles, so a custom model can be selected from the UI.
+    image_model: str = "sd15"
+    image_edit_model: str = "sd15-inpaint"
+    # Bumped when a saved setting needs a one-time correction.
+    config_version: int = 2
     # Local OVMS
     ovms_path: str = ""
     models_dir: str = ""
@@ -147,9 +153,12 @@ class Settings:
         self.max_output_tokens = max(16, min(int(self.max_output_tokens), 32768))
         self.short_history_turns = max(0, min(int(self.short_history_turns), 50))
         self.embed_dim = max(64, min(int(self.embed_dim), 2048))
-        self.document_pages_per_batch = max(1, min(int(self.document_pages_per_batch), 8))
+        # PDF accuracy: exactly one page per vision call, and every page is read.
+        # The fields remain for compatibility with old app.json files; the values
+        # are forced so a stale config cannot reintroduce batching or a page cap.
+        self.document_pages_per_batch = 1
         self.document_dpi = max(72, min(int(self.document_dpi), 220))
-        self.document_max_pages = max(0, min(int(self.document_max_pages), 20000))
+        self.document_max_pages = 0
         if self.embedding_backend not in ("hash", "ovms"):
             self.embedding_backend = "hash"
         self.temperature = max(0.0, min(float(self.temperature), 2.0))
@@ -192,7 +201,23 @@ class SettingsStore:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 raise ValueError("settings root must be an object")
-            return Settings.from_dict(raw)
+            migrated = False
+            try:
+                version = int(raw.get("config_version") or 0)
+            except (TypeError, ValueError):
+                version = 0
+            if version < 2:
+                # Older builds shipped 3 pages per call and a 300-page cap. Even
+                # though Settings now forces the corrected values, rewrite the file
+                # so the UI and the data folder do not keep advertising them.
+                raw["document_pages_per_batch"] = 1
+                raw["document_max_pages"] = 0
+                raw["config_version"] = 2
+                migrated = True
+            settings = Settings.from_dict(raw)
+            if migrated:
+                self.save(settings)
+            return settings
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             # Corrupt settings should never prevent the app from starting.
             backup = self.path.with_suffix(".corrupt.json")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 
 from aiolocal.memory import store
@@ -371,3 +372,63 @@ def test_delete_gallery_image_removes_file(env):
     assert response.status_code == 200
     assert not path.exists()
     assert env["client"].get("/api/v1/images/img-delete/file", headers=hdr(env)).status_code == 404
+
+
+def test_memory_breakdown_header_is_json(client, env):
+    response = client.post(
+        "/v1/chat/completions",
+        headers=hdr(env, **{"X-AIO-Conversation": "conv-memory-header"}),
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "Remember the green lamp."}],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+
+    breakdown = json.loads(response.headers["x-aio-memory-breakdown"])
+    assert isinstance(breakdown, dict)
+    assert response.headers["x-aio-memory-items"] == str(sum(breakdown.values()))
+
+
+def test_custom_model_scan_and_assign_endpoints(client, env):
+    from aiolocal.models import GRAPH_TEMPLATE
+
+    ctx = env["app"].state.ctx
+    folder = ctx.models.models_root() / "custom-endpoint-model"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "openvino_model.xml").write_text("<net/>", encoding="utf-8")
+    (folder / "openvino_model.bin").write_bytes(b"0" * 2_000_000)
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    (folder / "graph.pbtxt").write_text(GRAPH_TEMPLATE, encoding="utf-8")
+
+    scan = client.post("/api/v1/models/custom/scan", headers=hdr(env))
+    assert scan.status_code == 200, scan.text
+    fresh = scan.json()["new"]
+    assert len(fresh) == 1
+    model_id = fresh[0]["id"]
+
+    assign = client.post(
+        "/api/v1/models/custom/assign",
+        headers=hdr(env),
+        json={"model": model_id, "role": "chat", "device": "CPU"},
+    )
+    assert assign.status_code == 200, assign.text
+    result = assign.json()
+    assert result["role"] == "chat"
+    assert result["device"] == "CPU"
+    assert result["settings"]["chat_model"] == model_id
+
+    status = client.get("/api/v1/models", headers=hdr(env)).json()
+    custom = next(m for m in status["models"] if m["id"] == model_id)
+    assert custom["custom"] is True
+    assert custom["role_status"] == "assigned"
+    assert status["pending_models"] == []
+
+    removed = client.post(
+        "/api/v1/models/custom/remove",
+        headers=hdr(env),
+        json={"model": model_id},
+    )
+    assert removed.status_code == 200, removed.text
+    assert folder.exists()  # removing from the list does not delete the folder

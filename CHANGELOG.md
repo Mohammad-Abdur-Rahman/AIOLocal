@@ -4,7 +4,7 @@ All notable changes to AIO Local are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.1] - 2026-11-17
+## [0.2.1] - 2026-11-18
 
 A bug-fix release for memory deletion, document storage, knowledge folders and
 automatic routing. No new model or external service is required.
@@ -20,6 +20,14 @@ automatic routing. No new model or external service is required.
 - **Document memory is reliable in chat.** Pages are grouped into sections (about
   8 pages each, about 80 pages per part) with one durable summary row, and the
   document body is guaranteed a context budget instead of being trimmed away.
+- **Document jobs are always one page per vision call.** The saved settings can no longer
+  reintroduce three-page batches or a page cap; an old `app.json` is migrated to
+  `document_pages_per_batch: 1` and `document_max_pages: 0` on first load.
+- **Cancelled document jobs can be dismissed.** The progress bar now shows a **Hide** button
+  for cancelled, failed, interrupted and completed jobs.
+- **The memory badge matches the Memory view.** It reports "memory items" with a tooltip and
+  inspector breakdown for summary rows, page/section excerpts and history, so "5 items" next
+  to two summary rows is explained rather than looking like a counting bug.
 - **Nested knowledge folders work end to end.** Inbox folders map to nested
   collection slugs (`ai/papers`), missing parents are created automatically, and
   deleting a folder recursively removes child folders, documents, pages,
@@ -50,17 +58,29 @@ automatic routing. No new model or external service is required.
   worker status and optional scan limits.
 - The gateway accepts `X-AIO-Knowledge: auto`, reports the chosen route in the
   plan, and wraps knowledge excerpts as untrusted reference data.
+- **Custom OpenVINO models.** The Models view accepts a Hugging Face repository URL
+  or a folder copied into the models directory. Only OpenVINO IR layouts are
+  registered; ONNX, GGUF and SafeTensors folders are ignored with a reason. A new
+  folder stays pending until a role is chosen (chat, memory summary, embedding,
+  image generation or image editing), then settings, OVMS config, dropdowns and
+  `opencode.json` are updated automatically. Models are scanned at startup and on
+  demand; removing one keeps the folder on disk.
 
 ### Changed
 
 - PDF vision analysis now uses one page per model call for accuracy instead of
   batching three pages together.
-- `document_max_pages` defaults to `0` (unlimited, clamped to 20,000).
+- `document_max_pages` defaults to `0` and is no longer a cap; every PDF page is
+  analysed.
+- **Pillow is raised to 13.0.0** (`Pillow>=13,<14`), clearing the three
+  Dependabot alerts for CVE-2026-112902, CVE-2026-128066 and CVE-2026-128067
+  (TIFF libtiff encoder memory disclosure, TIFF scanline overflow, and TIFF/EXIF
+  IFD memory amplification).
 - Folder summaries are rebuilt automatically after a scan that adds documents.
 
 ### Validation
 
-- Full test suite: 118 passed.
+- Full test suite: 130 passed.
 - Corpus check on the reference library (385 documents, 6,072 chunks, 56
   folders): folder hit@3 100%, chunk hit@5 100%, negative control 100%.
 
@@ -70,5 +90,5 @@ First public release: local chat through OVMS, exact and summary memory, the
 Knowledge library, image generation, model management, the GIMP dock, and a
 Linux source-build path.
 
-[0.2.1]: https://github.com/Dargater/AIOLocal/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/Dargater/AIOLocal/releases/tag/v0.2.0
+[0.2.1]: https://github.com/Mohammad-Abdur-Rahman/AIOLocal/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/Mohammad-Abdur-Rahman/AIOLocal/releases/tag/v0.2.0

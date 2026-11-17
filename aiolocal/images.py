@@ -105,14 +105,33 @@ def _save_image(
     }
 
 
-def _active_image_model(ctx: AppContext, default: str) -> str:
-    try:
-        from .models import catalog_entry
+def _image_role(entry: dict, model_id: str) -> str:
+    key = str(entry.get("role_key") or "")
+    if key in ("image", "image_edit"):
+        return key
+    blob = f"{model_id} {entry.get('role', '')}".lower()
+    return "image_edit" if "inpaint" in blob or "editing" in blob else "image"
 
+
+def _active_image_model(ctx: AppContext, default: str, *, edit: bool = False) -> str:
+    wanted = "image_edit" if edit else "image"
+    try:
+        settings = ctx.settings
+        preferred = (settings.image_edit_model if edit else settings.image_model) or ""
+
+        def suitable(model_id: str) -> bool:
+            entry = ctx.models.entry(model_id) if ctx.models else None
+            return bool(
+                entry
+                and entry.get("task") == "image_generation"
+                and _image_role(entry, model_id) == wanted
+            )
+
+        if preferred and suitable(preferred):
+            return preferred
         active = (ctx.models.status() if ctx.models else {}).get("active") or {}
         for model_id in active:
-            entry = catalog_entry(model_id)
-            if entry and entry["task"] == "image_generation":
+            if suitable(model_id):
                 return model_id
     except Exception:
         pass
@@ -238,7 +257,7 @@ async def edit(request: Request):
         files["mask"] = ("mask.png", mask_bytes, "image/png")
 
     data = {
-        "model": _active_image_model(ctx, "sd15-inpaint"),
+        "model": _active_image_model(ctx, "sd15-inpaint", edit=True),
         "prompt": prompt,
         "n": str(max(1, min(2, int(body.get("n", 1) or 1)))),
     }
@@ -256,7 +275,7 @@ async def edit(request: Request):
     return _store_result(
         ctx,
         result,
-        {"prompt": prompt, "negative_prompt": data.get("negative_prompt", ""), "model": "sd15-inpaint"},
+        {"prompt": prompt, "negative_prompt": data.get("negative_prompt", ""), "model": data["model"]},
     )
 
 

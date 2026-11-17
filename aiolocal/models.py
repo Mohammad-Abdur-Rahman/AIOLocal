@@ -242,8 +242,306 @@ for _entry in CATALOG:
 _BY_ID = {m["id"]: m for m in CATALOG}
 
 
-def catalog_entry(model_id: str) -> dict | None:
-    return _BY_ID.get(model_id)
+def catalog_entry(model_id: str, paths: Paths | None = None) -> dict | None:
+    """Return a built-in entry, or a custom entry when ``paths`` is supplied."""
+    entry = _BY_ID.get(model_id)
+    if entry is not None or paths is None:
+        return entry
+    for custom in load_custom_models(paths):
+        if custom.get("id") == model_id:
+            return custom
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Custom OpenVINO models
+#
+# A custom model is a folder under the models root. It is accepted only when it
+# contains a real OpenVINO IR pair (.xml + .bin); ONNX, GGUF and SafeTensors are
+# explicitly rejected. Role assignment is separate: a detected model stays
+# "pending" until the user says what it is for.
+# ---------------------------------------------------------------------------
+
+ROLE_DEFINITIONS: dict[str, dict] = {
+    "chat": {
+        "task": "text_generation",
+        "role": "Main chat model",
+        "description": "Used by Chat, OpenCode and REA through the local gateway.",
+        "devices": ["GPU", "CPU"],
+        "default_device": "GPU",
+    },
+    "filing": {
+        "task": "text_generation",
+        "role": "Memory summary model",
+        "description": "Writes and consolidates durable conversation memory in the background.",
+        "devices": ["CPU", "GPU", "NPU"],
+        "default_device": "CPU",
+    },
+    "embedding": {
+        "task": "embeddings",
+        "role": "Embedding model",
+        "description": "Semantic vectors for memory, knowledge search and re-embedding.",
+        "devices": ["CPU", "GPU", "NPU"],
+        "default_device": "CPU",
+    },
+    "image": {
+        "task": "image_generation",
+        "role": "Image generation",
+        "description": "Text-to-image generation in the Images view.",
+        "devices": ["GPU", "CPU"],
+        "default_device": "GPU",
+    },
+    "image_edit": {
+        "task": "image_generation",
+        "role": "Image editing",
+        "description": "Inpainting and image edits in the Images view.",
+        "devices": ["GPU", "CPU"],
+        "default_device": "GPU",
+    },
+}
+
+ROLE_ALIASES = {
+    "main": "chat",
+    "main_chat": "chat",
+    "chat_model": "chat",
+    "summary": "filing",
+    "memory": "filing",
+    "filing_model": "filing",
+    "embedding_model": "embedding",
+    "embeddings": "embedding",
+    "image_generation": "image",
+    "generate": "image",
+    "inpaint": "image_edit",
+    "edit": "image_edit",
+    "image_inpaint": "image_edit",
+}
+
+_OV_METADATA_FILES = (
+    "config.json",
+    "openvino_config.json",
+    "model_index.json",
+    "graph.pbtxt",
+)
+_NON_OV_SUFFIXES = {".onnx", ".safetensors", ".gguf", ".pt", ".pth", ".ckpt"}
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+    return slug[:64] or "custom-model"
+
+
+def custom_models_path(paths: Paths) -> Path:
+    return paths.config_dir / "custom_models.json"
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def load_custom_models(paths: Paths) -> list[dict]:
+    path = custom_models_path(paths)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    models = raw.get("models") if isinstance(raw, dict) else raw
+    if not isinstance(models, list):
+        return []
+    out: list[dict] = []
+    for item in models:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        entry = dict(item)
+        entry["custom"] = True
+        entry.setdefault("role_status", "assigned" if entry.get("role") else "pending")
+        entry.setdefault("task", "text_generation")
+        entry.setdefault("devices", ["GPU", "CPU"])
+        entry.setdefault("default_device", "GPU")
+        entry.setdefault("context", 8192)
+        entry.setdefault("size_gb", 0.0)
+        entry.setdefault("license", "Check upstream")
+        entry.setdefault("role", "Role not assigned")
+        entry.setdefault("description", "Custom OpenVINO model.")
+        entry.setdefault("vision", False)
+        entry.setdefault("ram_gb", 0)
+        entry.setdefault("spec", "")
+        out.append(entry)
+    return out
+
+
+def save_custom_models(paths: Paths, models: list[dict]) -> None:
+    path = custom_models_path(paths)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"models": models}, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def catalog_for(paths: Paths) -> list[dict]:
+    return [*CATALOG, *load_custom_models(paths)]
+
+
+def parse_hf_repo(value: str) -> str:
+    """Accept an org/repo id or a huggingface.co URL and return the repo id."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("enter a Hugging Face repository URL")
+    if "://" in raw:
+        parts = urlsplit(raw)
+        host = parts.netloc.lower()
+        if host not in ("huggingface.co", "www.huggingface.co", "hf.co"):
+            raise ValueError("only huggingface.co model URLs are accepted")
+        path = parts.path
+    else:
+        path = raw
+    segments = [part for part in path.strip("/").split("/") if part]
+    if len(segments) < 2:
+        raise ValueError("the URL must contain an organisation and a model name")
+    repo = "/".join(segments[:2])
+    if not valid_repo(repo):
+        raise ValueError("that is not a valid Hugging Face repository name")
+    return repo
+
+
+def _ir_pairs(directory: Path) -> list[tuple[Path, Path]]:
+    pairs: list[tuple[Path, Path]] = []
+    ignored = ("tokenizer", "detokenizer", "vocab")
+    try:
+        candidates = directory.rglob("*.xml")
+    except OSError:
+        return pairs
+    for xml in candidates:
+        if ".cache" in xml.parts:
+            continue
+        stem = xml.stem.lower()
+        if any(word in stem for word in ignored):
+            continue
+        weight = xml.with_suffix(".bin")
+        try:
+            if weight.is_file() and weight.stat().st_size > 0:
+                pairs.append((xml, weight))
+        except OSError:
+            continue
+    return pairs
+
+
+def _config_context(config: dict, default: int) -> int:
+    candidates = [
+        config.get("max_position_embeddings"),
+        config.get("max_sequence_length"),
+        config.get("seq_length"),
+        config.get("n_positions"),
+        (config.get("text_config") or {}).get("max_position_embeddings")
+        if isinstance(config.get("text_config"), dict) else None,
+    ]
+    for value in candidates:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 512 <= number <= 131072:
+            return number
+    return default
+
+
+def inspect_ov_folder(directory: Path, folder: str | None = None) -> dict:
+    """Validate an OpenVINO IR folder and infer a starting task/role hint."""
+    directory = Path(directory)
+    folder = folder or directory.name
+    if not directory.is_dir():
+        return {"ok": False, "reason": "folder not found", "kind": "", "task": ""}
+    pairs = _ir_pairs(directory)
+    has_meta = any((directory / name).is_file() for name in _OV_METADATA_FILES)
+    non_ov = 0
+    try:
+        for path in directory.rglob("*"):
+            if path.is_file() and ".cache" not in path.parts and path.suffix.lower() in _NON_OV_SUFFIXES:
+                non_ov += 1
+    except OSError:
+        non_ov = 0
+    if not pairs:
+        reason = "no OpenVINO IR .xml/.bin pair was found"
+        if non_ov:
+            reason += " (ONNX, GGUF and SafeTensors files are not supported)"
+        return {"ok": False, "reason": reason, "kind": "", "task": ""}
+    if not has_meta:
+        return {
+            "ok": False,
+            "reason": "the OpenVINO IR is missing config.json, openvino_config.json, "
+                      "model_index.json or graph.pbtxt",
+            "kind": "",
+            "task": "",
+        }
+
+    config = _read_json(directory / "config.json")
+    model_index = _read_json(directory / "model_index.json")
+    ov_config = _read_json(directory / "openvino_config.json")
+    blob = " ".join(
+        [
+            folder.lower(),
+            json.dumps(config, ensure_ascii=False).lower(),
+            json.dumps(model_index, ensure_ascii=False).lower(),
+            json.dumps(ov_config, ensure_ascii=False).lower(),
+            " ".join(xml.name.lower() for xml, _ in pairs),
+        ]
+    )
+
+    has_unet = any((directory / name).is_dir() for name in ("unet", "vae_decoder", "text_encoder"))
+    architectures = " ".join(
+        str(item).lower() for item in (config.get("architectures") or []) if item
+    )
+    model_type = str(config.get("model_type") or "").lower()
+    # Do not match plain "embedding" in the whole blob: every text config has
+    # ``max_position_embeddings``, which would misclassify chat models.
+    embedding_signal = (
+        "embedding" in folder.lower()
+        or "embedding" in architectures
+        or "sentence-transformers" in blob
+        or "feature-extraction" in blob
+        or "text-embeddings" in blob
+        or model_type in ("bert", "xlm-roberta", "nomic_bert", "modernbert")
+    )
+    if model_index or has_unet:
+        kind = "image"
+        task = "image_generation"
+    elif embedding_signal:
+        kind = "embeddings"
+        task = "embeddings"
+    else:
+        kind = "text"
+        task = "text_generation"
+
+    vision = any(
+        token in blob
+        for token in (
+            "vision_config", "vision_model", "image_token", "multimodal",
+            "qwen2_vl", "qwen2.5-vl", "qwen3_vl", "llava", "pixtral", "image-text",
+        )
+    )
+    edit_hint = "inpaint" in blob or "inpainting" in blob
+    size_bytes = 0
+    try:
+        for path in directory.rglob("*"):
+            if path.is_file() and ".cache" not in path.parts:
+                size_bytes += path.stat().st_size
+    except OSError:
+        pass
+    default_context = 32768 if kind == "embeddings" else (512 if kind == "image" else 8192)
+    return {
+        "ok": True,
+        "reason": "",
+        "kind": kind,
+        "task": task,
+        "vision": vision,
+        "edit_hint": edit_hint,
+        "context": _config_context(config, default_context),
+        "size_gb": round(size_bytes / (1024 ** 3), 2),
+        "pairs": len(pairs),
+    }
 
 
 _DLL_DIRECTORY_LOCK = threading.Lock()
@@ -293,7 +591,11 @@ class ModelManager:
         self.paths = paths
         self.settings_store = settings_store
         self.state_path = paths.config_dir / "models.json"
+        self.custom_state_path = custom_models_path(paths)
         self._lock = threading.RLock()
+        self._custom: list[dict] = load_custom_models(paths)
+        self._last_scan = 0.0
+        self._scan_ignored: dict[str, str] = {}
         self._pull_threads: set[str] = set()
         self._pull_errors: dict[str, str] = {}
         self._pull_progress: dict[str, dict] = {}
@@ -329,8 +631,39 @@ class ModelManager:
         os.replace(tmp, self.state_path)
 
     def model_dir(self, entry: dict) -> Path:
+        if entry.get("folder"):
+            return self.models_root() / str(entry["folder"])
         name = entry["repo"].split("/", 1)[-1]
         return self.models_root() / name
+
+    def entries(self) -> list[dict]:
+        """Built-in catalog plus custom folders, without copying the dicts."""
+        with self._lock:
+            custom = list(self._custom)
+        return [*CATALOG, *custom]
+
+    def entry(self, model_id: str) -> dict | None:
+        for item in self.entries():
+            if item.get("id") == model_id:
+                return item
+        return None
+
+    def custom_entry(self, model_id: str) -> dict | None:
+        with self._lock:
+            for item in self._custom:
+                if item.get("id") == model_id:
+                    return item
+        return None
+
+    def pending_entries(self) -> list[dict]:
+        with self._lock:
+            return [
+                dict(item) for item in self._custom
+                if item.get("role_status") != "assigned"
+            ]
+
+    def _save_custom(self) -> None:
+        save_custom_models(self.paths, self._custom)
 
     def models_root(self) -> Path:
         settings = self.settings_store.load()
@@ -351,11 +684,12 @@ class ModelManager:
         plus at least one complete weight file outside the Hugging Face cache.
         """
         now = time.time()
-        cached = self._installed_cache.get(entry["repo"])
+        key = str(entry.get("folder") or entry.get("repo") or entry.get("id") or "")
+        cached = self._installed_cache.get(key)
         if cached and now - cached[0] < 5.0:
             return cached[1]
         result = self._installed_uncached(entry)
-        self._installed_cache[entry["repo"]] = (now, result)
+        self._installed_cache[key] = (now, result)
         return result
 
     def _installed_uncached(self, entry: dict) -> bool:
@@ -392,6 +726,307 @@ class ModelManager:
 
     def pull_progress(self, model_id: str) -> dict | None:
         return self._pull_progress.get(model_id)
+
+    # ------------------------------------------------------------------ custom models
+    def _unique_id(self, base: str) -> str:
+        used = {str(item.get("id")) for item in self.entries()}
+        candidate = _slug(base)
+        if candidate not in used:
+            return candidate
+        index = 2
+        while f"{candidate}-{index}" in used:
+            index += 1
+        return f"{candidate}-{index}"
+
+    def register_custom_folder(
+        self,
+        folder: str,
+        *,
+        source: str = "local",
+        repo: str = "",
+        info: dict | None = None,
+    ) -> dict:
+        """Register a validated folder as a pending custom model."""
+        clean = Path(folder).name
+        directory = self.models_root() / clean
+        info = info or inspect_ov_folder(directory, clean)
+        if not info.get("ok"):
+            raise ValueError(str(info.get("reason") or "not an OpenVINO IR model"))
+        with self._lock:
+            existing = next(
+                (item for item in self._custom if str(item.get("folder", "")).lower() == clean.lower()),
+                None,
+            )
+            if existing is not None:
+                existing.update(
+                    {
+                        "task": info["task"],
+                        "vision": bool(info.get("vision")),
+                        "context": info.get("context", existing.get("context", 8192)),
+                        "size_gb": info.get("size_gb", existing.get("size_gb", 0.0)),
+                        "edit_hint": bool(info.get("edit_hint")),
+                        "detected_kind": info.get("kind", ""),
+                    }
+                )
+                self._save_custom()
+                return existing
+
+            entry = {
+                "id": self._unique_id(clean),
+                "repo": repo or f"local/{clean}",
+                "name": clean,
+                "task": info["task"],
+                "devices": ["GPU", "CPU"],
+                "default_device": "GPU",
+                "context": info.get("context", 8192),
+                "size_gb": info.get("size_gb", 0.0),
+                "license": "Check upstream",
+                "role": "Role not assigned",
+                "description": "Custom OpenVINO IR model detected in the models folder.",
+                "vision": bool(info.get("vision")),
+                "ram_gb": 0,
+                "spec": "",
+                "folder": clean,
+                "source": source,
+                "custom": True,
+                "role_status": "pending",
+                "detected_kind": info.get("kind", ""),
+                "edit_hint": bool(info.get("edit_hint")),
+                "created_at": int(time.time() * 1000),
+            }
+            self._custom.append(entry)
+            self._save_custom()
+            return entry
+
+    def scan_custom_models(self, *, force: bool = False) -> list[dict]:
+        """Find new OpenVINO folders in the models directory.
+
+        Called at startup and by the Models view. A folder is registered once and
+        stays pending until the user chooses a role for it.
+        """
+        now = time.time()
+        with self._lock:
+            if not force and now - self._last_scan < 5.0:
+                return []
+            self._last_scan = now
+            known = {
+                str(item.get("folder", "")).lower()
+                for item in self._custom
+                if item.get("folder")
+            }
+        known |= {
+            entry["repo"].split("/")[-1].lower()
+            for entry in CATALOG
+        }
+        root = self.models_root()
+        if not root.is_dir():
+            return []
+        try:
+            children = sorted(
+                (child for child in root.iterdir() if child.is_dir()),
+                key=lambda child: child.name.lower(),
+            )
+        except OSError:
+            return []
+        fresh: list[dict] = []
+        for child in children:
+            if child.name.startswith(".") or child.name.lower() in known:
+                continue
+            candidate = inspect_ov_folder(child, child.name)
+            if not candidate.get("ok"):
+                self._scan_ignored[child.name] = str(candidate.get("reason") or "not OpenVINO")
+                continue
+            try:
+                entry = self.register_custom_folder(
+                    child.name,
+                    source="local",
+                    repo="",
+                    info=candidate,
+                )
+            except ValueError:
+                continue
+            if entry.get("role_status") != "assigned":
+                fresh.append(dict(entry))
+        return fresh
+
+    def assign_role(
+        self,
+        model_id: str,
+        role: str,
+        *,
+        vision: bool | None = None,
+        device: str = "",
+    ) -> dict:
+        """Bind a custom model to a module and write the matching settings."""
+        key = ROLE_ALIASES.get(str(role or "").strip().lower(), str(role or "").strip().lower())
+        definition = ROLE_DEFINITIONS.get(key)
+        if definition is None:
+            raise ValueError("choose chat, filing, embedding, image or image_edit")
+        entry = self.custom_entry(model_id)
+        if entry is None:
+            raise ValueError("that is not a custom model")
+        info = inspect_ov_folder(self.model_dir(entry), entry.get("folder") or entry.get("name"))
+        if not info.get("ok"):
+            raise ValueError(info.get("reason") or "the model folder is no longer a valid OpenVINO IR")
+        entry.update(
+            {
+                "task": definition["task"],
+                "role": definition["role"],
+                "description": definition["description"],
+                "devices": list(definition["devices"]),
+                "default_device": definition["default_device"],
+                "role_status": "assigned",
+                "role_key": key,
+                "vision": bool(info.get("vision") if vision is None else vision),
+                "context": info.get("context", entry.get("context", 8192)),
+                "size_gb": info.get("size_gb", entry.get("size_gb", 0.0)),
+                "edit_hint": key == "image_edit",
+                "detected_kind": info.get("kind", ""),
+            }
+        )
+        self._save_custom()
+
+        settings = self.settings_store.load()
+        auto_load = [item for item in (settings.auto_load or []) if item != model_id]
+        auto_load.append(model_id)
+        settings.auto_load = auto_load[-32:]
+        chosen_device = (device or entry["default_device"]).upper()
+        if key == "chat":
+            settings.chat_model = model_id
+        elif key == "filing":
+            settings.filing_model = model_id
+        elif key == "embedding":
+            settings.embedding_backend = "ovms"
+            settings.embedding_model = model_id
+        elif key == "image":
+            settings.image_model = model_id
+        elif key == "image_edit":
+            settings.image_edit_model = model_id
+        self.settings_store.save(settings)
+        loaded = self.load(model_id, chosen_device)
+        return {
+            "ok": True,
+            "model": model_id,
+            "role": key,
+            "role_label": definition["role"],
+            "device": loaded.get("device", chosen_device),
+            "settings": settings.to_dict(),
+            "opencode_needs_reload": key == "chat",
+            "embedding_needs_reembed": key == "embedding",
+        }
+
+    def remove_custom(self, model_id: str) -> dict:
+        with self._lock:
+            entry = next((item for item in self._custom if item.get("id") == model_id), None)
+            if entry is None:
+                raise ValueError("that is not a custom model")
+            folder = entry.get("folder")
+            self._custom = [item for item in self._custom if item.get("id") != model_id]
+            self._save_custom()
+            self._state.setdefault("active", {}).pop(model_id, None)
+            self._save_state()
+        if folder:
+            self._scan_ignored[str(folder)] = "removed by the user"
+        self.write_config()
+        return {"ok": True, "model": model_id, "folder": folder}
+
+    def start_custom_pull(self, url_or_repo: str, publish=None) -> dict:
+        """Download any OpenVINO IR repository from Hugging Face."""
+        repo = parse_hf_repo(url_or_repo)
+        folder = repo.split("/")[-1]
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", folder):
+            raise ValueError("the repository name cannot be used as a folder name")
+        static_folders = {entry["repo"].split("/")[-1].lower() for entry in CATALOG}
+        if folder.lower() in static_folders:
+            raise ValueError("that repository is already in the built-in catalog")
+        existing = next(
+            (item for item in self._custom if str(item.get("folder", "")).lower() == folder.lower()),
+            None,
+        )
+        if existing is not None:
+            return {
+                "ok": True,
+                "already_detected": True,
+                "model": existing["id"],
+                "repo": repo,
+            }
+        target = self.models_root() / folder
+        if target.is_dir():
+            info = inspect_ov_folder(target, folder)
+            if info.get("ok"):
+                entry = self.register_custom_folder(folder, source="huggingface", repo=repo, info=info)
+                return {"ok": True, "already_installed": True, "model": entry["id"], "repo": repo}
+
+        model_id = self._unique_id(folder)
+        if model_id in self._pull_threads:
+            return {"ok": True, "already_running": True, "model": model_id, "repo": repo}
+        self.models_root().mkdir(parents=True, exist_ok=True)
+        self._pull_errors.pop(model_id, None)
+        self._pull_progress[model_id] = {
+            "state": "starting",
+            "percent": 0.0,
+            "downloaded": self._dir_size(target) if target.exists() else 0,
+            "total": max(1, self._remote_size(repo)),
+            "started_at": time.time(),
+            "repo": repo,
+            "kind": "custom",
+        }
+
+        def publish_progress(**extra) -> None:
+            if not publish:
+                return
+            payload = {"model": model_id, **self._pull_progress.get(model_id, {}), **extra}
+            publish("model_pull", payload)
+
+        def worker() -> None:
+            stop = threading.Event()
+
+            def monitor() -> None:
+                while not stop.wait(1.5):
+                    got = self._dir_size(target) if target.exists() else 0
+                    total = max(1, int(self._pull_progress[model_id].get("total") or 1))
+                    percent = min(99.0, round(got * 100.0 / total, 1))
+                    self._pull_progress[model_id].update(
+                        {"state": "running", "downloaded": got, "percent": percent}
+                    )
+                    publish_progress()
+
+            monitor_thread = threading.Thread(
+                target=monitor, name=f"custom-pull-progress-{model_id}", daemon=True
+            )
+            monitor_thread.start()
+            try:
+                from huggingface_hub import snapshot_download
+
+                self._pull_progress[model_id]["state"] = "running"
+                publish_progress()
+                snapshot_download(repo_id=repo, local_dir=str(target))
+                info = inspect_ov_folder(target, folder)
+                if not info.get("ok"):
+                    raise ValueError(
+                        "the downloaded repository is not a usable OpenVINO IR model: "
+                        + str(info.get("reason") or "unknown layout")
+                    )
+                entry = self.register_custom_folder(folder, source="huggingface", repo=repo, info=info)
+                got = self._dir_size(target)
+                self._pull_progress[model_id].update(
+                    {"state": "done", "percent": 100.0, "downloaded": got, "detected": entry["id"]}
+                )
+                self._pull_errors.pop(model_id, None)
+                self._installed_cache.clear()
+                publish_progress()
+            except Exception as exc:
+                self._pull_errors[model_id] = f"{type(exc).__name__}: {exc}"[:600]
+                self._pull_progress[model_id]["state"] = "failed"
+                publish_progress(error=self._pull_errors[model_id])
+            finally:
+                stop.set()
+                monitor_thread.join(timeout=3)
+                self._pull_threads.discard(model_id)
+
+        self._pull_threads.add(model_id)
+        threading.Thread(target=worker, name=f"custom-pull-{model_id}", daemon=True).start()
+        return {"ok": True, "started": True, "model": model_id, "repo": repo}
 
     # ------------------------------------------------------------------ config
     def _graph_source(self, entry: dict) -> Path | None:
@@ -506,7 +1141,7 @@ class ModelManager:
         with self._lock:
             active = dict(self._state.get("active") or {})
         for model_id, info in active.items():
-            entry = _BY_ID.get(model_id)
+            entry = self.entry(model_id)
             if not entry or not self.installed(entry):
                 continue
             device = str(info.get("device") or entry["default_device"]).upper()
@@ -550,7 +1185,7 @@ class ModelManager:
             return False, f"OVMS is not reachable ({type(exc).__name__}). Start it, then reload."
 
     def load(self, model_id: str, device: str) -> dict:
-        entry = _BY_ID.get(model_id)
+        entry = self.entry(model_id)
         if not entry:
             raise ValueError("unknown model")
         if device not in entry["devices"]:
@@ -579,22 +1214,33 @@ class ModelManager:
         return {"ok": True, "model": model_id}
 
     def status(self, upstream_health: dict | None = None) -> dict:
+        # Catch a folder the user copied in while the app was open. This is
+        # throttled inside scan_custom_models, so 1.5 s status polling stays cheap.
+        try:
+            self.scan_custom_models()
+        except Exception:
+            pass
         active = dict(self._state.get("active") or {})
         models = []
-        for entry in CATALOG:
+        for entry in self.entries():
             info = active.get(entry["id"]) or {}
             progress = self._pull_progress.get(entry["id"]) or {}
             models.append(
                 {
-                    **{k: entry[k] for k in ("id", "repo", "name", "task", "devices", "default_device",
-                                             "context", "size_gb", "license", "role", "description",
-                                             "ram_gb", "spec")},
+                    **{k: entry.get(k) for k in ("id", "repo", "name", "task", "devices",
+                                                 "default_device", "context", "size_gb", "license",
+                                                 "role", "description", "ram_gb", "spec")},
                     "vision": bool(entry.get("vision", False)),
                     "installed": self.installed(entry),
                     "loaded": entry["id"] in active,
+                    "custom": bool(entry.get("custom")),
+                    "role_status": entry.get("role_status", "assigned"),
+                    "source": entry.get("source", "catalog"),
+                    "path": str(self.model_dir(entry)),
+                    "folder": entry.get("folder", ""),
                     "graph_ready": self._graph_source(entry) is not None,
                     "graph_error": self._graph_errors.get(entry["id"], ""),
-                    "device": info.get("device") or entry["default_device"],
+                    "device": info.get("device") or entry.get("default_device", "GPU"),
                     "pulling": self.pull_active(entry["id"]),
                     "pull_percent": progress.get("percent"),
                     "pull_downloaded": progress.get("downloaded"),
@@ -603,9 +1249,28 @@ class ModelManager:
                     "pull_error": self._pull_errors.get(entry["id"]),
                 }
             )
+        known = {str(item.get("id")) for item in self.entries()}
+        custom_pulls = []
+        for model_id, progress in self._pull_progress.items():
+            if model_id in known:
+                continue
+            if progress.get("state") not in ("starting", "running", "failed"):
+                continue
+            custom_pulls.append(
+                {
+                    "model": model_id,
+                    "repo": progress.get("repo", ""),
+                    **progress,
+                    "error": self._pull_errors.get(model_id, ""),
+                }
+            )
         exe = self._ovms_executable()
         return {
             "models": models,
+            "custom_models": [dict(item) for item in self._custom],
+            "pending_models": self.pending_entries(),
+            "custom_pulls": custom_pulls,
+            "ignored_folders": dict(self._scan_ignored),
             "active": active,
             "models_dir": str(self.models_root()),
             "config_path": str(self.config_path),

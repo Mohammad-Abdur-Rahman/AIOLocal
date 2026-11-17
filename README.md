@@ -3,9 +3,37 @@
 **A local, memory-first AI workspace for Intel laptops.** Chat, image generation, model
 management, and a transparent long-term memory system — all on `127.0.0.1`, with no cloud calls.
 
-This is **v0.2.0**, the first public release. It is a real, working product: chat, memory,
-a knowledge/reference library, local image generation, a GIMP dock, and a source-build path
-for Linux. What exists is listed below; what does not exist is listed just as plainly.
+This is **v0.2.1**, a bug-fix release on top of the first public release. It is a real,
+working product: chat, memory, a knowledge/reference library, local image generation, a GIMP
+dock, and a source-build path for Linux. What exists is listed below; what does not exist is
+listed just as plainly.
+
+---
+
+## What's fixed in 0.2.1
+
+- **Deleting a memory now removes everything derived from it.** Summaries, topic links, raw
+  messages, FTS rows, vectors and now-empty topics are deleted in one cascade, so a deleted
+  conversation cannot reappear through a summary or an embedding.
+- **PDFs keep every page and can resume.** Each page is rendered and analysed separately, stored
+  without a page cap, and survives cancel/resume. Long documents are grouped into sections
+  (about 8 pages per section, about 80 pages per part) with one durable memory row, so chat can
+  answer from any page instead of a truncated summary.
+- **Knowledge folders are real folders.** Nested inbox folders map to nested collection slugs
+  (`ai/papers`), parents are created automatically, and deleting a folder cascades to child
+  folders, documents, pages, sections, vectors and jobs.
+- **Automatic routing finds the right folder.** Folder summaries now carry a rarity-weighted
+  term profile built from every chunk, query terms are matched with bounded morphology, and
+  matches are weighted by inverse folder frequency. A pypdfium2 question routes to
+  `dev/pdfium`, not to an unrelated framework that happens to mention "page".
+- **Scans no longer stop at the first 40 files.** Inbox scans are unlimited by default, support
+  `.mdx`, count only new files toward an optional limit, and report progress while they run.
+- **Search can abstain.** Candidates are re-ranked by query-term coverage, and an unrelated
+  question returns nothing instead of the least-bad chunk.
+- **The reference corpus is reproducible.** `tools/kb_sync.py` installs the Tier-1 corpus with
+  provenance and licence metadata; `tools/kb_eval.py` verifies routing, chunk retrieval and
+  negative controls (385 documents / 6,072 chunks: 100% folder hit@3, 100% chunk hit@5,
+  100% negative control on this machine).
 
 ---
 
@@ -25,11 +53,11 @@ for Linux. What exists is listed below; what does not exist is listed just as pl
 | Model catalog, device choice, load/unload via OVMS config reload | ✅ |
 | Image generation/edit proxy + local gallery | ✅ |
 | Image attachments to a vision chat model (Qwen3-VL 4B) | ✅ |
-| PDF chat attachments: every page rendered and analysed in 3-page vision batches into one durable memory entry | ✅ |
+| PDF chat attachments: every page rendered and analysed one page per vision call, grouped into section memory and resumable jobs | ✅ |
 | Offline math rendering (bundled KaTeX) and PDF text extraction (pypdf) | ✅ |
 | Local-only security: loopback bind, per-install token, origin/host checks, CSP | ✅ |
 | Windows build (PyInstaller onedir) and Linux source build | ✅ |
-| Independent Knowledge library (separate DB, FTS5 + vectors, inbox, upload isolation, opt-in per message) | ✅ |
+| Independent Knowledge library (separate DB, FTS5 + vectors, nested folders, automatic routing, inbox, opt-in per message) | ✅ |
 | Code workspace (OpenCode lifecycle + workspace preview) | ✅ |
 | Reverse engineering (REA MCP stdio client, tool console, lifecycle) | ✅ |
 | Embedded GIMP dock (Win32 host + embed + external fallback) | ✅ |
@@ -176,8 +204,8 @@ workspace\           code workspace
 
 - The server binds **127.0.0.1 only** and rejects non-local `Host`/`Origin` headers.
 - Every API call needs the per-install token; the UI receives it in a same-origin page.
-- No telemetry, no analytics, no remote logging, no auto-update.
-- The only outbound traffic is model download, triggered explicitly from the Models page.
+- Model downloads, Setup component downloads, and explicit web-search or knowledge-sync requests are
+  the only outbound traffic. There is no telemetry, analytics, remote logging, or auto-update.
 
 See `SECURITY.md` for the threat model and reporting instructions.
 
@@ -217,9 +245,11 @@ aiolocal/
   events.py          server-sent events
   memory/            text, store, retrieve, assemble, filing, jobs, semantic
   documents.py       PDF pages -> vision model -> durable document memory
+  knowledge.py       separate reference library, folder routing, scan/enrich jobs
   photogimp.py       optional PhotoGIMP manager (Windows)
   web/               no-build HTML/CSS/JS UI
 tests/               unit + integration tests (fake upstream, no GPU needed)
+tools/               kb_sync.py and kb_eval.py for the reference corpus
 packaging/           PyInstaller spec and build script
 PLAN/                the full architecture plan (design source of truth)
 ```

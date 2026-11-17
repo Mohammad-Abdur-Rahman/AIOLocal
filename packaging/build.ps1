@@ -4,7 +4,7 @@
 #
 # Output:
 #   dist\AIOLocal\AIOLocal.exe
-#   dist\AIOLocal-0.2.0-win64.zip
+#   dist\AIOLocal-<version>-win64.zip
 #
 # The build is a PyInstaller "onedir" bundle so startup stays fast and the web
 # assets are visible for auditing. No model weights are bundled.
@@ -18,6 +18,9 @@ $python = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $python)) {
     throw "Missing .venv. Create it with: python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -e `".[dev]`""
 }
+
+$version = (& $python -c "import aiolocal; print(aiolocal.__version__)").Trim()
+if (-not $version) { throw "Could not read the package version" }
 
 Write-Host "Installing build tools..." -ForegroundColor Cyan
 & $python -m pip install --quiet --upgrade "pyinstaller>=6.11,<7"
@@ -55,7 +58,7 @@ foreach ($doc in @("README.md", "NOTICE", "LICENSE", "SECURITY.md")) {
     }
 }
 
-$zip = Join-Path $root "dist\AIOLocal-0.2.0-win64.zip"
+$zip = Join-Path $root "dist\AIOLocal-$version-win64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Write-Host "Creating zip..." -ForegroundColor Cyan
 Compress-Archive -Path (Join-Path $root "dist\AIOLocal\*") -DestinationPath $zip

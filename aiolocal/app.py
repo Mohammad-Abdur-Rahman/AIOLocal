@@ -98,8 +98,18 @@ def create_app(
             log.warning("invalid upstream URL in settings; falling back to 127.0.0.1:8000")
             upstream = Upstream("http://127.0.0.1:8000")
         bus = EventBus()
-        worker = MemoryWorker(db, settings, on_event=bus.publish)
         models = ModelManager(paths, settings_store, publish=bus.publish)
+        # Deleting a model folder by hand used to leave settings pointing at a
+        # graph OVMS no longer serves. Repair those references before any module
+        # (chat, memory, OpenCode, documents) starts using them.
+        try:
+            repaired_models = bool(models.repair_settings_references())
+            if repaired_models:
+                settings = settings_store.load()
+        except Exception:
+            repaired_models = False
+            log.exception("could not repair model references in settings")
+        worker = MemoryWorker(db, settings, on_event=bus.publish)
         requirements = RequirementsManager(paths, settings_store, publish=bus.publish)
         kb = None
         kb_worker = None
@@ -115,11 +125,18 @@ def create_app(
         # OpenCode talks to this app's gateway, not directly to OVMS: it must go
         # through memory, knowledge opt-in and web-safety handling.
         code_ws = CodeWorkspace(
-        paths,
-        settings_store,
-        base_url=f"http://127.0.0.1:{port}",
-        model_manager=models,
-    )
+            paths,
+            settings_store,
+            base_url=f"http://127.0.0.1:{port}",
+            model_manager=models,
+        )
+        if repaired_models:
+            # OpenCode's config names a model; refresh it after a stale custom
+            # model was dropped from settings.
+            try:
+                code_ws.write_config()
+            except OSError:
+                log.exception("could not rewrite the OpenCode config after repair")
         reverse = ReverseEngineering(settings_store, paths)
 
         def lookup_image(image_id: str):
@@ -135,7 +152,7 @@ def create_app(
             return path
 
         gimp = GimpDock(paths, settings_store, image_lookup=lookup_image)
-        documents = DocumentAnalyzer(paths, settings_store, db, publish=bus.publish)
+        documents = DocumentAnalyzer(paths, settings_store, db, publish=bus.publish, models=models)
         ctx = AppContext(
             paths=paths,
             settings_store=settings_store,

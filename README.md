@@ -44,6 +44,12 @@ listed just as plainly.
   OpenVINO IR folder into the models directory. The app scans on startup, prompts for a role
   (chat, memory summary, embedding, image generation or image editing), then configures the
   matching settings, OVMS config, dropdowns and `opencode.json` exactly like a built-in model.
+  Removing a model from the list keeps the folder on disk, clears every setting that pointed
+  at it, and stays removed after a restart; a folder deleted by hand is flagged as missing and
+  repaired at startup.
+- **The Chat dropdown is the app-wide model switch.** It saves the selected model, updates
+  the header pill, reloads `opencode.json`, and is used by chat, document analysis, memory
+  summaries and OpenCode. A selected-but-unloaded model is loaded automatically.
 
 ---
 

@@ -313,7 +313,10 @@
     }
 
     const settings = payload.settings || state.settings || {};
-    $("#model-pill").textContent = settings.chat_model || "no model";
+    const models = (payload.models && payload.models.models) || (state.models && state.models.models) || [];
+    const chatId = settings.chat_model || "";
+    const chatEntry = models.find((model) => model.id === chatId);
+    $("#model-pill").textContent = chatEntry ? (chatEntry.name || chatId) : (chatId || "no model");
     $("#mem-pill").textContent = settings.memory_enabled === false ? "memory off" : "memory on";
 
     if (payload.paths) state.paths = payload.paths;
@@ -480,6 +483,8 @@
     if (!select) return;
     const models = ((state.models && state.models.models) || []).filter(
       (model) => model.task === "text_generation" &&
+        model.missing !== true &&
+        (model.custom ? model.installed !== false : true) &&
         (model.role_status === undefined || model.role_status === "assigned")
     );
     const preferred = (state.settings && state.settings.chat_model) || "";
@@ -1253,6 +1258,7 @@
           )}</select>
           <label class="check"><input type="checkbox" data-custom-vision="${escapeAttr(model.id)}" ${model.vision ? "checked" : ""}> Image input (vision)</label>
           <button class="btn primary small" type="button" data-custom-assign="${escapeAttr(model.id)}">Use this model</button>
+          <button class="btn ghost small" type="button" data-custom-remove="${escapeAttr(model.id)}">Remove from list</button>
         </div>
       </div>`).join("");
   }
@@ -1267,7 +1273,9 @@
     const ignored = Object.keys(data.ignored_folders || {}).length;
     status.textContent =
       `Models folder: ${data.models_dir || ""}` +
-      (ignored ? ` · ${ignored} folder${ignored === 1 ? "" : "s"} ignored (not OpenVINO IR)` : "");
+      (ignored
+        ? ` · ${ignored} folder${ignored === 1 ? "" : "s"} ignored (removed, or not OpenVINO IR). Press Scan to look again.`
+        : "");
 
     const progress = $("#custom-model-progress");
     if (progress) {
@@ -1293,16 +1301,25 @@
     }
     const list = $("#custom-model-list");
     if (list) {
-      const assigned = (data.custom_models || []).filter((m) => m.role_status === "assigned");
-      list.innerHTML = assigned.length
-        ? `<h3>Custom models</h3>` + assigned.map((m) => `
+      const rows = (data.custom_models || []).filter(
+        (m) => m.role_status === "assigned" || m.missing
+      );
+      list.innerHTML = rows.length
+        ? `<h3>Custom models</h3>` + rows.map((m) => `
             <div class="model-card">
               <div class="model-head">
                 <div>
                   <div class="model-name">${escapeHtml(m.name || m.id)}</div>
                   <div class="model-repo">${escapeHtml(m.folder || m.repo || "")}</div>
                 </div>
-                <span class="tag">${escapeHtml(m.role || "custom")}</span>
+                ${m.missing
+                  ? '<span class="tag warn">folder missing</span>'
+                  : `<span class="tag">${escapeHtml(m.role || "custom")}</span>`}
+              </div>
+              <div class="model-desc">
+                ${m.missing
+                  ? "The model folder was moved or deleted. Remove it from the list so it stops appearing in chat and document jobs."
+                  : ""}
               </div>
               <div class="model-actions">
                 <span class="muted small">${escapeHtml(m.path || "")}</span>
@@ -1416,9 +1433,21 @@
 
   async function removeCustomModel(id) {
     try {
-      await api("/models/custom/remove", { method: "POST", body: { model: id } });
-      toast(`${id} removed from the model list. The folder was kept.`);
-      state.promptedCustom.delete(id);
+      const result = await api("/models/custom/remove", { method: "POST", body: { model: id } });
+      if (result.settings) state.settings = result.settings;
+      const cleared = result.cleared_settings || [];
+      const clearedText = cleared.length
+        ? ` Reset: ${cleared.map((k) => k.replace(/_/g, " ")).join(", ")}.`
+        : "";
+      const folderText = result.folder_exists === false
+        ? " The folder was already gone."
+        : " The folder was left on disk.";
+      toast(`${id} removed from the list.${clearedText}${folderText}`, false);
+      state.promptedCustom.add(id);
+      const modalBody = $("#modal-body");
+      if (modalBody && !$("#modal").classList.contains("hidden") && modalBody.querySelector(`[data-custom-row="${CSS.escape(id)}"]`)) {
+        closeModal();
+      }
       await refreshModels();
       await refreshState();
     } catch (err) {
@@ -2493,6 +2522,41 @@
   }
 
   /* ------------------------------------------------------------ settings */
+  async function saveChatModel(modelId) {
+    if (!modelId) return;
+    const current = (state.settings && state.settings.chat_model) || "";
+    if (modelId === current) return;
+    try {
+      const result = await api("/settings", { method: "PUT", body: { chat_model: modelId } });
+      state.settings = result.settings || state.settings;
+      const entry = ((state.models && state.models.models) || []).find((model) => model.id === modelId);
+      const name = (entry && entry.name) || modelId;
+      applyPills({ settings: state.settings, models: state.models });
+      toast(`${name} is now the chat model. Documents, memory, OpenCode and REA use it too.`);
+      if (entry && entry.installed === false) {
+        toast(`${name} is not downloaded yet. Download it in Models before chatting.`, true);
+      } else if (entry && !entry.loaded) {
+        // Switching the model should just work: load it instead of asking the
+        // user to find the Models view and press Load.
+        const device = entry.device || entry.default_device || "GPU";
+        toast(`Loading ${name} on ${device}...`);
+        try {
+          const loaded = await api(`/models/${encodeURIComponent(modelId)}/load`, {
+            method: "POST",
+            body: { device },
+          });
+          if (loaded && loaded.message) toast(loaded.message, loaded.verified === false);
+          else toast(`${name} loaded on ${loaded.device || device}.`);
+        } catch (loadErr) {
+          toast(`${name} is selected but could not be loaded: ${loadErr.message}`, true);
+        }
+      }
+      await refreshState();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
   async function saveImageChoice(field, value) {
     if (!value) return;
     try {
@@ -2791,6 +2855,7 @@
     $("#pending-models").addEventListener("click", customActions);
     $("#custom-model-list").addEventListener("click", customActions);
     $("#modal-body").addEventListener("click", customActions);
+    $("#chat-model").addEventListener("change", () => saveChatModel($("#chat-model").value));
     $("#img-model").addEventListener("change", () => saveImageChoice("image_model", $("#img-model").value));
     $("#img-edit-model").addEventListener("change", () => saveImageChoice("image_edit_model", $("#img-edit-model").value));
     $("#ovms-start").addEventListener("click", async () => {

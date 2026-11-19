@@ -102,9 +102,18 @@ async def put_settings(request: Request):
         except OSError as exc:
             return _err(400, f"cannot use that models folder: {exc}", "invalid_models_dir")
 
+    previous_chat = ctx.settings.chat_model
     ctx.update_settings(new_settings)
+    result: dict = {"ok": True, "settings": new_settings.to_dict()}
+    if new_settings.chat_model != previous_chat and ctx.code_ws is not None:
+        # OpenCode's config names the default model, so it must follow the chat
+        # dropdown without waiting for a restart.
+        try:
+            result["opencode_config"] = str(ctx.code_ws.write_config())
+        except OSError as exc:
+            result["opencode_error"] = f"could not write the OpenCode config: {exc}"
     ctx.bus.publish("settings_changed", {})
-    return {"ok": True, "settings": new_settings.to_dict()}
+    return result
 
 
 # ------------------------------------------------------------------------- chats
@@ -475,11 +484,18 @@ async def custom_model_remove(request: Request):
         result = ctx.models.remove_custom(model_id)
     except ValueError as exc:
         return _err(400, str(exc), "model_error")
+    if result.get("settings"):
+        from .config import Settings
+
+        try:
+            ctx.update_settings(Settings.from_dict(result["settings"]))
+        except (ValueError, TypeError):
+            pass
     if ctx.code_ws is not None:
         try:
-            ctx.code_ws.write_config()
-        except OSError:
-            pass
+            result["opencode_config"] = str(ctx.code_ws.write_config())
+        except OSError as exc:
+            result["opencode_error"] = f"could not write the OpenCode config: {exc}"
     if ctx.models.ovms_running():
         ok, message = await ctx.models.reload(ctx.upstream)
         result["reload"] = {"ok": ok, "message": message}

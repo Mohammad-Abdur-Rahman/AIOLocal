@@ -553,12 +553,16 @@ class CodeWorkspace:
 
             entries = CATALOG
 
-        return [
-            {"id": m["id"], "name": m["name"]}
-            for m in entries
-            if m.get("task") == "text_generation"
-            and m.get("role_status", "assigned") == "assigned"
-        ]
+        rows: list[dict] = []
+        for entry in entries:
+            if entry.get("task") != "text_generation":
+                continue
+            if entry.get("role_status", "assigned") != "assigned":
+                continue
+            if self.model_manager is not None and self.model_manager.is_missing(entry):
+                continue
+            rows.append({"id": entry["id"], "name": entry["name"]})
+        return rows
 
     # ------------------------------------------------------------------ provider config
     def write_config(self) -> Path:
@@ -569,6 +573,9 @@ class CodeWorkspace:
         """
         settings = self.settings_store.load()
         token = self._token()
+        available = self._models(settings)
+        ids = [model["id"] for model in available]
+        chosen = settings.chat_model if settings.chat_model in ids else (ids[0] if ids else settings.chat_model)
         config = {
             "$schema": "https://opencode.ai/config.json",
             "provider": {
@@ -581,11 +588,11 @@ class CodeWorkspace:
                     },
                     "models": {
                         m["id"]: {"name": m["name"]}
-                        for m in self._models(settings)
+                        for m in available
                     },
                 }
             },
-            "model": f"aiolocal/{settings.chat_model}",
+            "model": f"aiolocal/{chosen}",
         }
         path = self.paths.config_dir / "opencode.json"
         tmp = path.with_suffix(".tmp")

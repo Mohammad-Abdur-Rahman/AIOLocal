@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -273,3 +274,105 @@ def test_assign_role_rejects_unknown_custom_model(tmp_path: Path):
 
     with pytest.raises(ValueError, match="not a custom model"):
         manager.assign_role("qwen3.5-9b", "chat")
+
+
+def test_removed_custom_model_stays_removed_after_restart(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    make_custom_folder(manager, "removed-model")
+    entry = manager.scan_custom_models(force=True)[0]
+
+    manager.remove_custom(entry["id"])
+
+    folder = manager.models_root() / "removed-model"
+    assert folder.is_dir()  # removal never deletes the user's files
+    assert manager.pending_entries() == []
+
+    # Reopening the app must not resurrect a folder the user removed.
+    reopened = ModelManager(manager.paths, manager.settings_store)
+    reopened.scan_custom_models()
+    assert reopened.custom_entry(entry["id"]) is None
+    assert reopened.pending_entries() == []
+
+    # "Scan now" is the explicit escape hatch that re-adds it.
+    fresh = reopened.scan_custom_models(force=True)
+    assert [model["folder"] for model in fresh] == ["removed-model"]
+
+
+def test_ignored_entry_is_dropped_when_the_folder_disappears(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    folder = make_custom_folder(manager, "gone-ignored")
+    entry = manager.scan_custom_models(force=True)[0]
+
+    manager.remove_custom(entry["id"])
+    assert manager.status()["ignored_folders"] == {"gone-ignored": "removed by the user"}
+
+    shutil.rmtree(folder)
+    manager._last_scan = 0.0
+    manager.scan_custom_models()
+
+    # Nothing to re-add, so the marker must not linger forever.
+    assert manager.status()["ignored_folders"] == {}
+
+
+def test_remove_custom_model_clears_settings_and_falls_back(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    directory = model_dir(manager)
+    (directory / "openvino_language_model.bin").write_bytes(b"0" * 2_000_000)
+    manager._installed_cache.clear()
+
+    make_custom_folder(manager, "custom-chat")
+    entry = manager.scan_custom_models(force=True)[0]
+    manager.assign_role(entry["id"], "chat", device="CPU")
+    assert manager.settings_store.load().chat_model == entry["id"]
+
+    result = manager.remove_custom(entry["id"])
+
+    settings = manager.settings_store.load()
+    assert settings.chat_model == "qwen3.5-9b"
+    assert entry["id"] not in settings.auto_load
+    assert "chat_model" in result["cleared_settings"]
+    assert "auto_load" in result["cleared_settings"]
+    assert result["settings"]["chat_model"] == "qwen3.5-9b"
+
+
+def test_missing_custom_folder_is_flagged_and_not_offered(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    folder = make_custom_folder(manager, "gone-model")
+    entry = manager.scan_custom_models(force=True)[0]
+
+    shutil.rmtree(folder)
+    manager._installed_cache.clear()
+
+    assert manager.pending_entries() == []
+    status = manager.status()
+    custom = next(model for model in status["custom_models"] if model["id"] == entry["id"])
+    listed = next(model for model in status["models"] if model["id"] == entry["id"])
+    assert custom["missing"] is True
+    assert custom["installed"] is False
+    assert listed["missing"] is True
+
+
+def test_repair_clears_settings_for_a_deleted_custom_folder(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    folder = make_custom_folder(manager, "deleted-by-hand")
+    entry = manager.scan_custom_models(force=True)[0]
+    manager.assign_role(entry["id"], "chat", device="CPU")
+
+    shutil.rmtree(folder)
+    manager._installed_cache.clear()
+
+    reopened = ModelManager(manager.paths, manager.settings_store)
+    changed = reopened.repair_settings_references()
+
+    assert "chat_model" in changed
+    settings = reopened.settings_store.load()
+    assert settings.chat_model != entry["id"]
+    assert entry["id"] not in settings.auto_load
+
+
+def test_repair_leaves_external_model_names_alone(tmp_path: Path):
+    manager = make_manager(tmp_path)
+    manager.settings_store.save(Settings(chat_model="fake-model"))
+
+    assert manager.repair_settings_references() == []
+    assert manager.settings_store.load().chat_model == "fake-model"

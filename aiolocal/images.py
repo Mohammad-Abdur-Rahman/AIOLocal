@@ -125,6 +125,8 @@ def _active_image_model(ctx: AppContext, default: str, *, edit: bool = False) ->
                 entry
                 and entry.get("task") == "image_generation"
                 and _image_role(entry, model_id) == wanted
+                and not ctx.models.is_missing(entry)
+                and ctx.models.installed(entry)
             )
 
         if preferred and suitable(preferred):

@@ -47,6 +47,22 @@ def _error(status: int, message: str, code: str, kind: str = "invalid_request_er
     )
 
 
+def _upstream_message(exc: UpstreamError, model: str = "") -> str:
+    """Translate OVMS's cryptic MediaPipe 404 into something actionable."""
+    text = str(getattr(exc, "message", "") or "")
+    if "ediapipe graph definition" in text or "graph definition with requested name" in text:
+        name = model or "the selected model"
+        return (
+            f"{name} is not loaded in the local model server, so the request could "
+            "not be served. Load it in Models, or pick a loaded model in the Chat "
+            "dropdown (the whole app follows that choice)."
+        )
+    return (
+        f"The local model server rejected the request: {text}. "
+        "Check that OVMS is running and the model is loaded."
+    )
+
+
 def _memory_headers(plan: dict) -> dict[str, str]:
     """Count what actually entered the prompt, split by memory kind.
 
@@ -559,8 +575,7 @@ async def chat_completions(request: Request):
         except UpstreamError as exc:
             return _error(
                 502,
-                f"The local model server rejected the request: {exc.message}. "
-                "Check that OVMS is running and the model is loaded.",
+                _upstream_message(exc, str(payload.get("model") or "")),
                 "upstream_error",
                 "upstream_error",
             )
@@ -586,7 +601,7 @@ async def chat_completions(request: Request):
     try:
         data = await ctx.upstream.complete(payload)
     except UpstreamError as exc:
-        return _error(502, exc.message, "upstream_error", "upstream_error")
+        return _error(502, _upstream_message(exc, str(payload.get("model") or "")), "upstream_error", "upstream_error")
     except httpx.HTTPError as exc:
         return _error(
             503,
@@ -704,7 +719,7 @@ async def _passthrough(ctx: AppContext, body: dict):
         try:
             upstream_resp = await ctx.upstream.start_stream(payload)
         except UpstreamError as exc:
-            return _error(502, exc.message, "upstream_error", "upstream_error")
+            return _error(502, _upstream_message(exc, str(payload.get("model") or "")), "upstream_error", "upstream_error")
         except httpx.HTTPError as exc:
             return _error(503, f"Cannot reach the model server ({type(exc).__name__}).", "upstream_unavailable", "upstream_error")
 
@@ -720,7 +735,7 @@ async def _passthrough(ctx: AppContext, body: dict):
         data = await ctx.upstream.complete(payload)
         return JSONResponse(content=data)
     except UpstreamError as exc:
-        return _error(502, exc.message, "upstream_error", "upstream_error")
+        return _error(502, _upstream_message(exc, str(payload.get("model") or "")), "upstream_error", "upstream_error")
     except httpx.HTTPError as exc:
         return _error(503, f"Cannot reach the model server ({type(exc).__name__}).", "upstream_unavailable", "upstream_error")
 

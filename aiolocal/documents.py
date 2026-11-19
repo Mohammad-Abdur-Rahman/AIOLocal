@@ -139,11 +139,15 @@ class DocumentAnalyzer:
         db: Database,
         *,
         publish: Callable[[str, dict], None] | None = None,
+        models=None,
     ) -> None:
         self.paths = paths
         self.settings_store = settings_store
         self.db = db
         self.publish = publish
+        # Optional ModelManager, used to avoid calling a model whose folder was
+        # deleted or that is not active in OVMS (which returns a MediaPipe 404).
+        self.models = models
         self.dir = paths.data_dir / "documents"
         self.dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -240,8 +244,8 @@ class DocumentAnalyzer:
             except OSError:
                 pass
             raise DocumentError(
-                "No vision model is available. Download and load Qwen3.5 9B or "
-                "Qwen3-VL 4B in the Models view first."
+                "No vision model is available. Load Qwen3.5 9B or Qwen3-VL 4B in "
+                "the Models view, then select it in Chat."
             )
         suffix = Path(filename or upload.name).suffix.lower()
         if suffix != ".pdf":
@@ -683,13 +687,38 @@ class DocumentAnalyzer:
     def _vision_model(self, settings: Settings) -> str:
         preferred = str(settings.chat_model or "").strip()
         entries = [*CATALOG, *load_custom_models(self.paths)]
+        candidates: list[dict] = []
         for entry in entries:
-            if entry["id"] == preferred and entry.get("vision") and entry.get("task") == "text_generation":
-                return preferred
-        for entry in entries:
-            if entry.get("vision") and entry.get("task") == "text_generation":
+            if entry.get("task") != "text_generation" or not entry.get("vision"):
+                continue
+            if entry.get("custom"):
+                if entry.get("role_status") != "assigned":
+                    continue
+                if self.models is not None and not self.models.installed(entry):
+                    continue
+            candidates.append(entry)
+        if not candidates:
+            return ""
+
+        served: set[str] = set()
+        if self.models is not None:
+            try:
+                served = self.models.served_ids()
+            except Exception:  # pragma: no cover - never block analysis on status
+                served = set()
+
+        preferred_entry = next((e for e in candidates if e["id"] == preferred), None)
+        # The saved chat model is authoritative while OVMS can actually serve it.
+        if preferred_entry is not None and (not served or preferred in served):
+            return preferred
+        # Otherwise use a vision model OVMS is serving, so a deleted or unloaded
+        # model cannot make every document job fail with a MediaPipe 404.
+        for entry in candidates:
+            if entry["id"] in served:
                 return entry["id"]
-        return ""
+        if preferred_entry is not None:
+            return preferred
+        return candidates[0]["id"]
 
     def _client(self, settings: Settings) -> httpx.Client:
         return httpx.Client(
@@ -755,9 +784,16 @@ class DocumentAnalyzer:
         with self._client(settings) as client:
             response = client.post(url, json=payload)
         if response.status_code >= 400:
+            detail = response.text[:400]
+            if "ediapipe graph definition" in detail or "graph definition with requested name" in detail:
+                raise DocumentError(
+                    f"{model} is not loaded in the local model server, so pages "
+                    f"{first}-{last} could not be analysed. Load {model} in Models, "
+                    "or choose a loaded vision model in Chat."
+                )
             raise DocumentError(
                 f"the model server rejected pages {first}-{last} "
-                f"(HTTP {response.status_code}): {response.text[:400]}"
+                f"(HTTP {response.status_code}): {detail}"
             )
         try:
             data = response.json()

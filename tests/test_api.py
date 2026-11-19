@@ -432,3 +432,59 @@ def test_custom_model_scan_and_assign_endpoints(client, env):
     )
     assert removed.status_code == 200, removed.text
     assert folder.exists()  # removing from the list does not delete the folder
+
+
+def test_custom_model_remove_clears_stale_model_references(client, env):
+    from aiolocal.models import GRAPH_TEMPLATE
+
+    ctx = env["app"].state.ctx
+    folder = ctx.models.models_root() / "stale-chat-model"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "openvino_model.xml").write_text("<net/>", encoding="utf-8")
+    (folder / "openvino_model.bin").write_bytes(b"0" * 2_000_000)
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    (folder / "graph.pbtxt").write_text(GRAPH_TEMPLATE, encoding="utf-8")
+
+    model_id = client.post("/api/v1/models/custom/scan", headers=hdr(env)).json()["new"][0]["id"]
+    client.post(
+        "/api/v1/models/custom/assign",
+        headers=hdr(env),
+        json={"model": model_id, "role": "chat", "device": "CPU"},
+    )
+
+    removed = client.post(
+        "/api/v1/models/custom/remove",
+        headers=hdr(env),
+        json={"model": model_id},
+    )
+    assert removed.status_code == 200, removed.text
+    result = removed.json()
+    assert "chat_model" in result["cleared_settings"]
+    assert result["settings"]["chat_model"] != model_id
+    assert ctx.settings.chat_model != model_id
+
+    config = json.loads((env["paths"].config_dir / "opencode.json").read_text(encoding="utf-8"))
+    assert model_id not in config["provider"]["aiolocal"]["models"]
+    assert config["model"] != f"aiolocal/{model_id}"
+
+    # A normal status poll must not re-register the folder the user removed.
+    ctx.models._last_scan = 0.0
+    ctx.models.scan_custom_models()
+    status = client.get("/api/v1/models", headers=hdr(env)).json()
+    assert not any(model["id"] == model_id for model in status["models"])
+    assert status["pending_models"] == []
+
+
+def test_chat_model_setting_updates_the_opencode_config(client, env):
+    response = client.put(
+        "/api/v1/settings",
+        headers=hdr(env),
+        json={"chat_model": "qwen3-4b"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["settings"]["chat_model"] == "qwen3-4b"
+    assert "opencode_config" in body
+    config = json.loads((env["paths"].config_dir / "opencode.json").read_text(encoding="utf-8"))
+    assert config["model"] == "aiolocal/qwen3-4b"

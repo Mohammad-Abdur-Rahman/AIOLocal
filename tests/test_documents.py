@@ -334,3 +334,29 @@ def test_document_endpoint_streams_upload_and_finishes(env):
     summary = store.get_summary(env["app"].state.ctx.db, current["summary_id"])
     assert summary is not None
     assert summary["kind"] == "document"
+
+
+def test_deleted_custom_chat_model_falls_back_to_a_vision_model(tmp_path: Path):
+    import shutil
+
+    from aiolocal.models import GRAPH_TEMPLATE, ModelManager
+
+    analyzer, _, paths = make_analyzer(tmp_path)
+    manager = ModelManager(paths, analyzer.settings_store)
+    folder = manager.models_root() / "custom-vision"
+    folder.mkdir(parents=True)
+    (folder / "openvino_model.xml").write_text("<net/>", encoding="utf-8")
+    (folder / "openvino_model.bin").write_bytes(b"0" * 2_000_000)
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    (folder / "graph.pbtxt").write_text(GRAPH_TEMPLATE, encoding="utf-8")
+
+    entry = manager.register_custom_folder("custom-vision")
+    manager.assign_role(entry["id"], "chat", device="CPU")
+    assert analyzer.settings_store.load().chat_model == entry["id"]
+
+    # The user deletes the folder by hand instead of removing it in the UI.
+    shutil.rmtree(folder)
+    manager._installed_cache.clear()
+    analyzer.models = manager
+
+    assert analyzer._vision_model(analyzer.settings_store.load()) == "qwen3.5-9b"

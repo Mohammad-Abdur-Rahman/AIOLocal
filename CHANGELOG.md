@@ -28,6 +28,26 @@ automatic routing. No new model or external service is required.
 - **The memory badge matches the Memory view.** It reports "memory items" with a tooltip and
   inspector breakdown for summary rows, page/section excerpts and history, so "5 items" next
   to two summary rows is explained rather than looking like a counting bug.
+- **The chat dropdown now controls the whole app.** Choosing a model saves `chat_model`,
+  updates the header pill immediately, rewrites `opencode.json`, and is used by chat,
+  document analysis, memory summaries, images and OpenCode. If the chosen model is installed
+  but not loaded, the app loads it for you instead of asking for a manual unload/load.
+- **Removed custom models stay removed.** Removing a model clears its role references in
+  `chat_model`, `filing_model`, `embedding_model`, `image_model` and `image_edit_model`,
+  drops it from auto-load, regenerates the OVMS and OpenCode configs, and records the folder
+  as ignored so a restart or status poll cannot re-add it. The explicit **Scan models folder**
+  button is still able to bring it back. Delete an OpenVINO folder by hand and the next start
+  repairs the stale references automatically.
+- **Missing custom folders are visible and removable.** Custom models whose folder was moved
+  or deleted are flagged "folder missing" with a **Remove from list** button (pending models
+  have one in the role prompt too), and are no longer offered in the chat dropdown or in
+  pending-role prompts.
+- **A stale or unloaded vision model can no longer fail every document job.** Document
+  analysis only uses an assigned, installed custom model, prefers a vision model OVMS is
+  actually serving, and turns the opaque
+  `Mediapipe graph definition with requested name is not found` response into an actionable
+  "load it in Models or pick a loaded model in Chat" error. The same translation applies to
+  chat and OpenCode requests through the gateway.
 - **Nested knowledge folders work end to end.** Inbox folders map to nested
   collection slugs (`ai/papers`), missing parents are created automatically, and
   deleting a folder recursively removes child folders, documents, pages,
@@ -64,7 +84,7 @@ automatic routing. No new model or external service is required.
   folder stays pending until a role is chosen (chat, memory summary, embedding,
   image generation or image editing), then settings, OVMS config, dropdowns and
   `opencode.json` are updated automatically. Models are scanned at startup and on
-  demand; removing one keeps the folder on disk.
+  demand; removing one keeps the folder on disk and persists the removal.
 
 ### Changed
 
@@ -80,7 +100,7 @@ automatic routing. No new model or external service is required.
 
 ### Validation
 
-- Full test suite: 130 passed.
+- Full test suite: 141 passed.
 - Corpus check on the reference library (385 documents, 6,072 chunks, 56
   folders): folder hit@3 100%, chunk hit@5 100%, negative control 100%.
 

@@ -334,6 +334,34 @@ def custom_models_path(paths: Paths) -> Path:
     return paths.config_dir / "custom_models.json"
 
 
+def ignored_folders_path(paths: Paths) -> Path:
+    return paths.config_dir / "custom_models_ignored.json"
+
+
+def load_ignored_folders(paths: Paths) -> dict[str, str]:
+    """Folders the user removed from the list, so a restart does not re-add them."""
+    path = ignored_folders_path(paths)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(name): str(reason)
+        for name, reason in raw.items()
+        if str(name).strip()
+    }
+
+
+def save_ignored_folders(paths: Paths, ignored: dict[str, str]) -> None:
+    path = ignored_folders_path(paths)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(ignored, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _read_json(path: Path) -> dict:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -595,7 +623,7 @@ class ModelManager:
         self._lock = threading.RLock()
         self._custom: list[dict] = load_custom_models(paths)
         self._last_scan = 0.0
-        self._scan_ignored: dict[str, str] = {}
+        self._scan_ignored: dict[str, str] = load_ignored_folders(paths)
         self._pull_threads: set[str] = set()
         self._pull_errors: dict[str, str] = {}
         self._pull_progress: dict[str, dict] = {}
@@ -660,10 +688,28 @@ class ModelManager:
             return [
                 dict(item) for item in self._custom
                 if item.get("role_status") != "assigned"
+                and not self.is_missing(item)
             ]
+
+    def is_missing(self, entry: dict) -> bool:
+        """True when the registered custom folder is gone from disk."""
+        if not entry.get("custom"):
+            return False
+        return not self.model_dir(entry).is_dir()
 
     def _save_custom(self) -> None:
         save_custom_models(self.paths, self._custom)
+
+    def _save_ignored(self) -> None:
+        save_ignored_folders(self.paths, self._scan_ignored)
+
+    def _forget_ignored(self, name: str) -> None:
+        keys = [key for key in self._scan_ignored if key.lower() == str(name).lower()]
+        if not keys:
+            return
+        for key in keys:
+            self._scan_ignored.pop(key, None)
+        self._save_ignored()
 
     def models_root(self) -> Path:
         settings = self.settings_store.load()
@@ -752,6 +798,9 @@ class ModelManager:
         info = info or inspect_ov_folder(directory, clean)
         if not info.get("ok"):
             raise ValueError(str(info.get("reason") or "not an OpenVINO IR model"))
+        # An explicit registration (download or a fresh scan after the folder
+        # changed) clears the "removed by the user" marker for that folder.
+        self._forget_ignored(clean)
         with self._lock:
             existing = next(
                 (item for item in self._custom if str(item.get("folder", "")).lower() == clean.lower()),
@@ -818,6 +867,10 @@ class ModelManager:
             entry["repo"].split("/")[-1].lower()
             for entry in CATALOG
         }
+        # A model removed from the list stays removed across restarts. The explicit
+        # "Scan now" button (force=True) is the way to bring such a folder back.
+        if not force:
+            known |= {name.lower() for name in self._scan_ignored}
         root = self.models_root()
         if not root.is_dir():
             return []
@@ -828,6 +881,15 @@ class ModelManager:
             )
         except OSError:
             return []
+        if not force:
+            # Keep the ignore list (and the "N folders ignored" note) honest when a
+            # folder is deleted for good.
+            present = {child.name.lower() for child in children}
+            stale = [name for name in self._scan_ignored if name.lower() not in present]
+            if stale:
+                for name in stale:
+                    self._scan_ignored.pop(name, None)
+                self._save_ignored()
         fresh: list[dict] = []
         for child in children:
             if child.name.startswith(".") or child.name.lower() in known:
@@ -926,9 +988,132 @@ class ModelManager:
             self._state.setdefault("active", {}).pop(model_id, None)
             self._save_state()
         if folder:
+            # Persist the removal: without this, the next startup scan (or the
+            # 1.5 s status poll) re-adds the folder as a pending model.
             self._scan_ignored[str(folder)] = "removed by the user"
+            self._save_ignored()
         self.write_config()
-        return {"ok": True, "model": model_id, "folder": folder}
+
+        # A removed model must not stay selected in chat, memory, images or
+        # OpenCode; otherwise every module keeps calling a graph that no longer
+        # exists and gets a MediaPipe 404.
+        settings = self.settings_store.load()
+        cleared = self._clear_settings_reference(settings, model_id)
+        if cleared:
+            self.settings_store.save(settings)
+        return {
+            "ok": True,
+            "model": model_id,
+            "folder": folder,
+            "folder_exists": bool(folder) and (self.models_root() / str(folder)).is_dir(),
+            "cleared_settings": cleared,
+            "settings": settings.to_dict(),
+        }
+
+    def _fallback_text_model(self, exclude: str = "") -> str:
+        """Pick a usable text model after the selected one was removed."""
+        active = set(self._state.get("active") or {})
+        candidates: list[tuple[bool, int, str]] = []
+        for entry in self.entries():
+            model_id = str(entry.get("id") or "")
+            if not model_id or model_id == exclude:
+                continue
+            if entry.get("task") != "text_generation":
+                continue
+            if entry.get("role_status", "assigned") != "assigned":
+                continue
+            if self.is_missing(entry) or not self.installed(entry):
+                continue
+            preferred = 0 if model_id in ("qwen3.5-9b", "qwen3-vl-4b") else 1
+            candidates.append((model_id not in active, preferred, model_id))
+        if not candidates:
+            return ""
+        candidates.sort()
+        return candidates[0][2]
+
+    def _clear_settings_reference(self, settings, model_id: str) -> list[str]:
+        cleared: list[str] = []
+        if settings.chat_model == model_id:
+            settings.chat_model = self._fallback_text_model(exclude=model_id)
+            cleared.append("chat_model")
+        if settings.filing_model == model_id:
+            settings.filing_model = ""
+            cleared.append("filing_model")
+        if settings.embedding_model == model_id:
+            settings.embedding_model = "qwen3-embedding-0.6b"
+            if settings.embedding_backend == "ovms":
+                settings.embedding_backend = "hash"
+            cleared.append("embedding_model")
+        if settings.image_model == model_id:
+            settings.image_model = "sd15"
+            cleared.append("image_model")
+        if settings.image_edit_model == model_id:
+            settings.image_edit_model = "sd15-inpaint"
+            cleared.append("image_edit_model")
+        if model_id in list(settings.auto_load or []):
+            settings.auto_load = [item for item in settings.auto_load if item != model_id]
+            cleared.append("auto_load")
+        return cleared
+
+    def repair_settings_references(self) -> list[str]:
+        """Drop settings that point at a custom model whose folder disappeared.
+
+        Users delete model folders directly, and a stale ``chat_model`` makes
+        chat, OpenCode, REA, document analysis and memory summaries call a graph
+        OVMS no longer serves. Runs at startup; the Models view can still show
+        and remove the stale registry entry.
+        """
+        settings = self.settings_store.load()
+        changed: list[str] = []
+        stale = [
+            str(value or "").strip()
+            for value in (
+                settings.chat_model,
+                settings.filing_model,
+                settings.embedding_model,
+                settings.image_model,
+                settings.image_edit_model,
+            )
+            if str(value or "").strip()
+        ]
+        for model_id in dict.fromkeys(stale):
+            entry = self.entry(model_id)
+            # Unknown ids may be models served by an external OpenAI-compatible
+            # server; only a registered custom model whose folder vanished is stale.
+            if entry is None or not self.is_missing(entry):
+                continue
+            for key in self._clear_settings_reference(settings, model_id):
+                if key not in changed:
+                    changed.append(key)
+        usable = {
+            str(entry.get("id"))
+            for entry in self.entries()
+            if str(entry.get("id")) and not self.is_missing(entry)
+        }
+        auto_load = [item for item in (settings.auto_load or []) if item in usable]
+        if auto_load != list(settings.auto_load or []):
+            settings.auto_load = auto_load
+            if "auto_load" not in changed:
+                changed.append("auto_load")
+        if changed:
+            self.settings_store.save(settings)
+        return changed
+
+    def served_ids(self) -> set[str]:
+        """Models that are active *and* still have a usable folder and graph."""
+        with self._lock:
+            active = dict(self._state.get("active") or {})
+        served: set[str] = set()
+        for model_id in active:
+            entry = self.entry(model_id)
+            if entry is None or not self.installed(entry):
+                continue
+            if entry.get("custom") and self.is_missing(entry):
+                continue
+            if self._graph_source(entry) is None:
+                continue
+            served.add(model_id)
+        return served
 
     def start_custom_pull(self, url_or_repo: str, publish=None) -> dict:
         """Download any OpenVINO IR repository from Hugging Face."""
@@ -1232,9 +1417,10 @@ class ModelManager:
                                                  "role", "description", "ram_gb", "spec")},
                     "vision": bool(entry.get("vision", False)),
                     "installed": self.installed(entry),
-                    "loaded": entry["id"] in active,
+                    "loaded": entry["id"] in active and not self.is_missing(entry),
                     "custom": bool(entry.get("custom")),
                     "role_status": entry.get("role_status", "assigned"),
+                    "missing": self.is_missing(entry),
                     "source": entry.get("source", "catalog"),
                     "path": str(self.model_dir(entry)),
                     "folder": entry.get("folder", ""),
@@ -1267,7 +1453,14 @@ class ModelManager:
         exe = self._ovms_executable()
         return {
             "models": models,
-            "custom_models": [dict(item) for item in self._custom],
+            "custom_models": [
+                dict(
+                    item,
+                    missing=self.is_missing(item),
+                    installed=self.installed(item),
+                )
+                for item in self._custom
+            ],
             "pending_models": self.pending_entries(),
             "custom_pulls": custom_pulls,
             "ignored_folders": dict(self._scan_ignored),

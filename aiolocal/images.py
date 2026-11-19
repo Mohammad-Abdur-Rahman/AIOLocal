@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .context import AppContext
 from .db import json_dumps, now_ms
+from .errors import safe_failure
 from .memory.text import new_id
 from .security import safe_join
 
@@ -179,10 +180,23 @@ async def generate(request: Request):
         return _error(400, "body must be JSON", "invalid_json")
     if not isinstance(body, dict):
         return _error(400, "body must be an object", "invalid_body")
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return _error(400, "a prompt is required", "invalid_prompt")
+    if len(prompt) > 4000:
+        return _error(400, "prompt is too long (4000 characters max)", "invalid_prompt")
     try:
         payload = _sanitise(body)
     except ValueError as exc:
-        return _error(400, str(exc), "invalid_prompt")
+        return _error(
+            400,
+            safe_failure(
+                exc,
+                "validating the image prompt",
+                "The prompt is not valid. Use 1 to 4000 characters.",
+            ),
+            "invalid_prompt",
+        )
     payload["model"] = _active_image_model(ctx, payload["model"])
 
     try:
@@ -190,7 +204,11 @@ async def generate(request: Request):
     except Exception as exc:
         return _error(
             502,
-            f"The image model is not available: {exc}. Load an image_generation model in OVMS.",
+            safe_failure(
+                exc,
+                "generating an image",
+                "The image model is not available. Load an image_generation model in OVMS and try again.",
+            ),
             "image_upstream_error",
         )
 
@@ -221,7 +239,15 @@ def _store_result(ctx: AppContext, result: dict, payload: dict) -> JSONResponse:
                 )
             )
         except (ValueError, OSError) as exc:
-            return _error(502, f"Could not store the generated image: {exc}", "image_store_error")
+            return _error(
+                502,
+                safe_failure(
+                    exc,
+                    "storing a generated image",
+                    "The generated image could not be stored. Check that the images folder is writable.",
+                ),
+                "image_store_error",
+            )
     if not saved:
         return _error(502, "the image model returned no image data", "empty_image")
     ctx.bus.publish("image_done", {"count": len(saved), "ids": [s["id"] for s in saved]})
@@ -247,7 +273,16 @@ async def edit(request: Request):
     try:
         image_bytes, _ = _load_source(ctx, body.get("image_id"), body.get("image_b64"))
     except ValueError as exc:
-        return _error(400, str(exc), "invalid_image")
+        return _error(
+            400,
+            safe_failure(
+                exc,
+                "loading the source image",
+                "The source image could not be loaded. Choose an existing image or attach a "
+                "valid PNG, JPEG, WebP or GIF file.",
+            ),
+            "invalid_image",
+        )
 
     files = {"image": ("image.png", image_bytes, "image/png")}
     mask_bytes = None
@@ -271,7 +306,11 @@ async def edit(request: Request):
     except Exception as exc:
         return _error(
             502,
-            f"The inpainting model is not available: {exc}. Load sd15-inpaint in OVMS.",
+            safe_failure(
+                exc,
+                "editing an image",
+                "The inpainting model is not available. Load sd15-inpaint in OVMS and try again.",
+            ),
             "image_upstream_error",
         )
     return _store_result(

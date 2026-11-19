@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import __version__
 from .context import AppContext
 from .db import now_ms
+from .errors import safe_failure
 from .llm import validate_base_url
 from .memory import store
 from .memory.retrieve import retrieve
@@ -34,6 +35,13 @@ def _err(status: int, message: str, code: str) -> JSONResponse:
         status_code=status,
         content={"error": {"message": message, "type": "request_error", "code": code}},
     )
+
+
+def _fail(
+    status: int, exc: BaseException, action: str, message: str, code: str
+) -> JSONResponse:
+    """Log ``exc`` and respond with a curated message that never contains it."""
+    return _err(status, safe_failure(exc, action, message), code)
 
 
 @router.get("/health")
@@ -92,7 +100,15 @@ async def put_settings(request: Request):
         new_settings = Settings.from_dict(merged)
         new_settings.upstream_base_url = validate_base_url(new_settings.upstream_base_url)
     except (ValueError, TypeError) as exc:
-        return _err(400, f"invalid settings: {exc}", "invalid_settings")
+        return _err(
+            400,
+            safe_failure(
+                exc,
+                "validating settings",
+                "Some settings are invalid. Check numeric fields, URLs, paths and model IDs.",
+            ),
+            "invalid_settings",
+        )
 
     if new_settings.models_dir:
         try:
@@ -100,7 +116,15 @@ async def put_settings(request: Request):
 
             Path(new_settings.models_dir).expanduser().mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            return _err(400, f"cannot use that models folder: {exc}", "invalid_models_dir")
+            return _err(
+                400,
+                safe_failure(
+                    exc,
+                    "creating the models folder",
+                    "That folder cannot be used for models. Choose a writable folder.",
+                ),
+                "invalid_models_dir",
+            )
 
     previous_chat = ctx.settings.chat_model
     ctx.update_settings(new_settings)
@@ -111,7 +135,11 @@ async def put_settings(request: Request):
         try:
             result["opencode_config"] = str(ctx.code_ws.write_config())
         except OSError as exc:
-            result["opencode_error"] = f"could not write the OpenCode config: {exc}"
+            result["opencode_error"] = safe_failure(
+                exc,
+                "writing the OpenCode config",
+                "The settings were saved, but the OpenCode config could not be written. See the app log.",
+            )
     ctx.bus.publish("settings_changed", {})
     return result
 
@@ -299,6 +327,15 @@ async def load_model(model_id: str, request: Request):
         body = {}
     device = str((body or {}).get("device") or "").upper()
     entry = ctx.models.entry(model_id)
+    if entry is None:
+        return _err(400, "Unknown model. Refresh the Models view and try again.", "model_error")
+    if ctx.models.pull_active(model_id):
+        return _err(400, "That model is still downloading. Wait for it to finish.", "model_error")
+    if not ctx.models.installed(entry):
+        return _err(400, "That model is not downloaded yet. Download it in Models first.", "model_error")
+    if device and device not in (entry.get("devices") or []):
+        allowed = ", ".join(entry.get("devices") or [])
+        return _err(400, f"That device is not supported for this model. Choose {allowed}.", "model_error")
     candidates = [device]
     if entry:
         for fallback in entry.get("fallback_devices") or []:
@@ -308,7 +345,16 @@ async def load_model(model_id: str, request: Request):
     try:
         result = ctx.models.load(model_id, device)
     except ValueError as exc:
-        return _err(400, str(exc), "model_error")
+        return _err(
+            400,
+            safe_failure(
+                exc,
+                "loading the model",
+                "The model could not be loaded. Check that its folder contains a complete "
+                "OpenVINO graph and that the OVMS log does not report a compile error.",
+            ),
+            "model_error",
+        )
 
     last_reload: dict = {}
     requested = result.get("device", device)
@@ -318,7 +364,14 @@ async def load_model(model_id: str, request: Request):
             try:
                 result = ctx.models.load(model_id, candidate)
             except ValueError as exc:
-                last_reload = {"ok": False, "message": str(exc)}
+                last_reload = {
+                    "ok": False,
+                    "message": safe_failure(
+                        exc,
+                        f"loading the model on {candidate}",
+                        f"The model could not be loaded on {candidate}.",
+                    ),
+                }
                 continue
         ok, message = await ctx.models.reload(ctx.upstream)
         last_reload = {"ok": ok, "message": message}
@@ -385,7 +438,16 @@ async def pull_model(model_id: str, request: Request):
     try:
         result = ctx.models.start_pull(model_id, publish=publish)
     except ValueError as exc:
-        return _err(400, str(exc), "model_error")
+        return _err(
+            400,
+            safe_failure(
+                exc,
+                "queueing the model download",
+                "The download could not be started. Check that the model exists and that "
+                "the models folder is writable.",
+            ),
+            "model_error",
+        )
     return result
 
 
@@ -407,7 +469,16 @@ async def custom_model_download(request: Request):
     try:
         result = ctx.models.start_custom_pull(url, publish=publish)
     except ValueError as exc:
-        return _err(400, str(exc), "model_error")
+        return _err(
+            400,
+            safe_failure(
+                exc,
+                "starting the custom model download",
+                "Enter a full Hugging Face model URL, for example "
+                "https://huggingface.co/OpenVINO/Qwen3-4B-Instruct-2507-int4-cw-ov.",
+            ),
+            "model_error",
+        )
     return result
 
 
@@ -417,7 +488,15 @@ async def custom_model_scan(request: Request):
     try:
         fresh = ctx.models.scan_custom_models(force=True)
     except Exception as exc:
-        return _err(500, f"could not scan the models folder: {exc}", "scan_error")
+        return _err(
+            500,
+            safe_failure(
+                exc,
+                "scanning the models folder",
+                "The models folder could not be scanned. Check that it exists and is readable.",
+            ),
+            "scan_error",
+        )
     return {
         "ok": True,
         "new": fresh,
@@ -447,7 +526,16 @@ async def custom_model_assign(request: Request):
             device=str(body.get("device") or ""),
         )
     except ValueError as exc:
-        return _err(400, str(exc), "model_error")
+        return _err(
+            400,
+            safe_failure(
+                exc,
+                "assigning the custom model",
+                "The model could not be assigned. Check that its folder is still a valid "
+                "OpenVINO IR model.",
+            ),
+            "model_error",
+        )
 
     from .config import Settings
 
@@ -455,13 +543,25 @@ async def custom_model_assign(request: Request):
         new_settings = Settings.from_dict(result.get("settings") or {})
         ctx.update_settings(new_settings)
     except (ValueError, TypeError) as exc:
-        return _err(400, f"model loaded but settings were invalid: {exc}", "invalid_settings")
+        return _err(
+            400,
+            safe_failure(
+                exc,
+                "applying the role settings",
+                "The model was found, but the resulting settings were invalid. See the app log.",
+            ),
+            "invalid_settings",
+        )
 
     if result.get("opencode_needs_reload") and ctx.code_ws is not None:
         try:
             result["opencode_config"] = str(ctx.code_ws.write_config())
         except OSError as exc:
-            result["opencode_error"] = f"could not write the OpenCode config: {exc}"
+            result["opencode_error"] = safe_failure(
+                exc,
+                "writing the OpenCode config",
+                "The role was assigned, but the OpenCode config could not be written. See the app log.",
+            )
     if ctx.models.ovms_running():
         ok, message = await ctx.models.reload(ctx.upstream)
         result["reload"] = {"ok": ok, "message": message}
@@ -483,7 +583,15 @@ async def custom_model_remove(request: Request):
     try:
         result = ctx.models.remove_custom(model_id)
     except ValueError as exc:
-        return _err(400, str(exc), "model_error")
+        return _err(
+            400,
+            safe_failure(
+                exc,
+                "removing the custom model",
+                "That model could not be removed from the list.",
+            ),
+            "model_error",
+        )
     if result.get("settings"):
         from .config import Settings
 
@@ -495,7 +603,11 @@ async def custom_model_remove(request: Request):
         try:
             result["opencode_config"] = str(ctx.code_ws.write_config())
         except OSError as exc:
-            result["opencode_error"] = f"could not write the OpenCode config: {exc}"
+            result["opencode_error"] = safe_failure(
+                exc,
+                "writing the OpenCode config",
+                "The model was removed, but the OpenCode config could not be written. See the app log.",
+            )
     if ctx.models.ovms_running():
         ok, message = await ctx.models.reload(ctx.upstream)
         result["reload"] = {"ok": ok, "message": message}
@@ -509,9 +621,21 @@ async def ovms_start(request: Request):
     try:
         return ctx.models.start_ovms()
     except ValueError as exc:
-        return _err(400, str(exc), "ovms_error")
+        return _fail(
+            400,
+            exc,
+            "starting OVMS",
+            "OVMS could not start. Check the OVMS path, the model config and the selected port.",
+            "ovms_error",
+        )
     except OSError as exc:
-        return _err(500, f"could not start OVMS: {exc}", "ovms_error")
+        return _fail(
+            500,
+            exc,
+            "starting OVMS",
+            "OVMS could not be launched. Check that its executable exists and that the port is free.",
+            "ovms_error",
+        )
 
 
 @router.post("/ovms/stop")
@@ -598,7 +722,13 @@ async def knowledge_folders_rebuild(request: Request):
             ctx.kb.rebuild_folder_summaries, embed_dim=ctx.settings.embed_dim
         )
     except Exception as exc:
-        return _err(500, f"could not rebuild folder summaries: {exc}", "folder_rebuild_failed")
+        return _fail(
+            500,
+            exc,
+            "rebuilding folder summaries",
+            "Folder summaries could not be rebuilt. Check the app log for details.",
+            "folder_rebuild_failed",
+        )
     return {"ok": True, **result, "collections": ctx.kb.list_collections()}
 
 
@@ -648,14 +778,30 @@ async def knowledge_upload(request: Request, collection: str = "general", filena
     ctx: AppContext = request.app.state.ctx
     if not ctx.kb:
         return _kb_unavailable()
-    from .knowledge import MAX_FILE_BYTES, KnowledgeError
+    from .knowledge import MAX_FILE_BYTES, SUPPORTED_EXTENSIONS, KnowledgeError
 
+    clean_name = Path(str(filename or "upload.txt")).name
+    suffix = Path(clean_name).suffix.lower()
+    if not clean_name or suffix not in SUPPORTED_EXTENSIONS:
+        shown = suffix or "(none)"
+        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        return _err(
+            400,
+            f"unsupported file type {shown}; supported: {supported}",
+            "invalid_file",
+        )
     try:
         temporary, target, slug = ctx.kb.upload_target(
-            filename or "upload.txt", collection or "general"
+            clean_name, collection or "general"
         )
     except KnowledgeError as exc:
-        return _err(400, str(exc), "invalid_file")
+        return _fail(
+            400,
+            exc,
+            "preparing the knowledge upload",
+            "That file cannot be imported. Use a text, Markdown, JSON or PDF file with a valid name.",
+            "invalid_file",
+        )
     received = 0
     try:
         with open(temporary, "wb") as handle:
@@ -664,25 +810,36 @@ async def knowledge_upload(request: Request, collection: str = "general", filena
                     continue
                 received += len(chunk)
                 if received > MAX_FILE_BYTES:
-                    raise KnowledgeError(
-                        f"file is too large (max {MAX_FILE_BYTES // (1024*1024)} MB)"
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    limit = MAX_FILE_BYTES // (1024 * 1024)
+                    return _err(
+                        400,
+                        f"file is too large (max {limit} MB)",
+                        "invalid_file",
                     )
                 handle.write(chunk)
         if received == 0:
-            raise KnowledgeError("the uploaded file is empty")
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return _err(400, "the uploaded file is empty", "invalid_file")
         os.replace(temporary, target)
-    except KnowledgeError as exc:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return _err(400, str(exc), "invalid_file")
     except OSError as exc:
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
-        return _err(500, f"could not store the upload: {exc}", "upload_failed")
+        return _fail(
+            500,
+            exc,
+            "storing the knowledge upload",
+            "The upload could not be stored. Check that the knowledge folder is writable and has free space.",
+            "upload_failed",
+        )
 
     try:
         from starlette.concurrency import run_in_threadpool
@@ -695,7 +852,13 @@ async def knowledge_upload(request: Request, collection: str = "general", filena
             docling_path=ctx.settings.docling_path,
         )
     except Exception as exc:
-        return _err(400, f"could not import the document: {exc}", "import_failed")
+        return _fail(
+            400,
+            exc,
+            "importing the knowledge document",
+            "The document could not be imported. Check that it contains readable text and is not encrypted.",
+            "import_failed",
+        )
     ctx.bus.publish("knowledge_document", {"state": "added", "document": result})
     return {
         "ok": True,
@@ -746,7 +909,13 @@ async def knowledge_search(request: Request):
             embed_dim=ctx.settings.embed_dim,
         )
     except Exception as exc:
-        return _err(500, f"knowledge search failed: {exc}", "search_failed")
+        return _fail(
+            500,
+            exc,
+            "searching the knowledge base",
+            "The knowledge search failed. Check the app log; the knowledge index may need a rebuild.",
+            "search_failed",
+        )
     return {"data": rows, "query": query}
 
 
@@ -763,7 +932,13 @@ async def knowledge_enrich(request: Request):
 
         count = await run_in_threadpool(ctx.kb_worker.enrich, ctx.settings)
     except Exception as exc:
-        return _err(500, f"enrichment failed: {exc}", "enrich_failed")
+        return _fail(
+            500,
+            exc,
+            "enriching knowledge documents",
+            "Enrichment failed. Check the app log; the memory chat model may not be loaded.",
+            "enrich_failed",
+        )
     return {"ok": True, "enriched": count, "stats": ctx.kb.stats()}
 
 
@@ -794,7 +969,13 @@ async def knowledge_scan(request: Request):
                 ctx.kb.rebuild_folder_summaries, embed_dim=ctx.settings.embed_dim
             )
     except Exception as exc:
-        return _err(500, f"inbox scan failed: {exc}", "scan_failed")
+        return _fail(
+            500,
+            exc,
+            "scanning the knowledge inbox",
+            "The inbox could not be scanned. Check that the inbox folder exists and is readable.",
+            "scan_failed",
+        )
     if ctx.kb_worker:
         ctx.kb_worker.notify()
     return {"ok": True, **result, "stats": ctx.kb.stats()}
@@ -820,9 +1001,21 @@ async def code_start(request: Request):
         ctx.code_ws.write_config()
         result = await run_in_threadpool(ctx.code_ws.start)
     except ValueError as exc:
-        return _err(400, str(exc), "code_error")
+        return _fail(
+            400,
+            exc,
+            "starting the code workspace",
+            "OpenCode could not start. Check the workspace path and that the OpenCode runtime is installed.",
+            "code_error",
+        )
     except OSError as exc:
-        return _err(500, f"could not start OpenCode: {exc}", "code_error")
+        return _fail(
+            500,
+            exc,
+            "starting OpenCode",
+            "OpenCode could not be started. Check that its executable exists and that the port is free.",
+            "code_error",
+        )
     ctx.bus.publish("code_status", {"running": True, "port": result.get("port")})
     return result
 
@@ -842,9 +1035,21 @@ async def code_embed(request: Request):
             ctx.bus.publish("code_status", {"running": True})
         status = ctx.code_ws.status()
     except ValueError as exc:
-        return _err(400, str(exc), "code_error")
+        return _fail(
+            400,
+            exc,
+            "preparing the embedded code workspace",
+            "OpenCode could not start. Check the workspace path and that the OpenCode runtime is installed.",
+            "code_error",
+        )
     except OSError as exc:
-        return _err(500, f"could not start OpenCode: {exc}", "code_error")
+        return _fail(
+            500,
+            exc,
+            "starting OpenCode for embedding",
+            "OpenCode could not be started. Check that its executable exists and that the port is free.",
+            "code_error",
+        )
     return {
         "ok": True,
         "running": status["running"],
@@ -879,7 +1084,13 @@ async def code_set_workspace(request: Request):
     try:
         root = ctx.code_ws.set_workspace(str((body or {}).get("path") or ""))
     except ValueError as exc:
-        return _err(400, str(exc), "invalid_workspace")
+        return _fail(
+            400,
+            exc,
+            "setting the code workspace",
+            "That workspace folder cannot be used. Choose an existing folder that you can write to.",
+            "invalid_workspace",
+        )
     from dataclasses import replace
 
     ctx.update_settings(replace(ctx.settings, workspace_dir=str(root)))
@@ -918,7 +1129,13 @@ async def code_read_file(request: Request, path: str = ""):
     try:
         return ctx.code_ws.read_file(path)
     except ValueError as exc:
-        return _err(400, str(exc), "read_error")
+        return _fail(
+            400,
+            exc,
+            "reading a workspace file",
+            "That file cannot be read. Check that it is inside the workspace and is a text file.",
+            "read_error",
+        )
 
 
 # ------------------------------------------------------------------------- reverse engineering
@@ -940,7 +1157,13 @@ async def re_start(request: Request):
 
         result = await run_in_threadpool(ctx.reverse.start)
     except Exception as exc:
-        return _err(500, f"could not start REA: {exc}", "re_error")
+        return _fail(
+            500,
+            exc,
+            "starting REA",
+            "REA could not start. Check the app log and the REA runtime settings.",
+            "re_error",
+        )
     ctx.bus.publish("re_status", {"running": True})
     return result
 
@@ -965,7 +1188,13 @@ async def re_tools(request: Request, refresh: int = 0):
 
         tools = await run_in_threadpool(ctx.reverse.tools, bool(refresh))
     except Exception as exc:
-        return _err(400, str(exc), "re_error")
+        return _fail(
+            400,
+            exc,
+            "listing REA tools",
+            "The REA tool list could not be read. Check that REA is installed and its MCP server starts.",
+            "re_error",
+        )
     return {"data": tools}
 
 
@@ -989,7 +1218,13 @@ async def re_call(request: Request):
 
         result = await run_in_threadpool(ctx.reverse.call, name, arguments)
     except Exception as exc:
-        return _err(400, str(exc), "re_error")
+        return _fail(
+            400,
+            exc,
+            "calling an REA tool",
+            "The REA tool call failed. Check the tool arguments and the app log.",
+            "re_error",
+        )
     return {"ok": True, "result": result}
 
 
@@ -1020,7 +1255,13 @@ async def gimp_launch(request: Request):
             ctx.gimp.launch, image_id=str(image_id) if image_id else None, embed=embed
         )
     except Exception as exc:
-        return _err(400, str(exc), "gimp_error")
+        return _fail(
+            400,
+            exc,
+            "launching the GIMP dock",
+            "The GIMP dock could not launch. Check that GIMP is installed and that the plugin is repaired.",
+            "gimp_error",
+        )
     ctx.bus.publish("gimp_status", {"running": True})
     return result
 
@@ -1048,7 +1289,13 @@ async def gimp_open(request: Request):
     try:
         return ctx.gimp.open_image(image_id)
     except Exception as exc:
-        return _err(400, str(exc), "gimp_error")
+        return _fail(
+            400,
+            exc,
+            "opening an image in GIMP",
+            "The image could not be opened in GIMP. Check that the image still exists and that GIMP is running.",
+            "gimp_error",
+        )
 
 
 @router.post("/gimp/repair")
@@ -1083,9 +1330,21 @@ async def photogimp_install(request: Request):
     try:
         result = await run_in_threadpool(PhotoGIMP(ctx.paths, ctx.gimp).install)
     except PhotoGimpError as exc:
-        return _err(400, str(exc), "photogimp_error")
+        return _fail(
+            400,
+            exc,
+            "installing PhotoGIMP",
+            "PhotoGIMP could not be installed. Check that GIMP is installed and that the download is reachable.",
+            "photogimp_error",
+        )
     except Exception as exc:
-        return _err(500, f"could not install PhotoGIMP: {exc}", "photogimp_error")
+        return _fail(
+            500,
+            exc,
+            "installing PhotoGIMP",
+            "PhotoGIMP could not be installed. See the app log for details.",
+            "photogimp_error",
+        )
     ctx.bus.publish("gimp_status", {"photogimp": "installed"})
     return result
 
@@ -1102,7 +1361,13 @@ async def photogimp_remove(request: Request):
     try:
         result = await run_in_threadpool(PhotoGIMP(ctx.paths, ctx.gimp).remove)
     except Exception as exc:
-        return _err(500, f"could not remove PhotoGIMP: {exc}", "photogimp_error")
+        return _fail(
+            500,
+            exc,
+            "removing PhotoGIMP",
+            "PhotoGIMP could not be removed. Check that its files are not open in GIMP.",
+            "photogimp_error",
+        )
     ctx.bus.publish("gimp_status", {"photogimp": "removed"})
     return result
 
@@ -1165,34 +1430,57 @@ async def document_analyze(request: Request, filename: str = ""):
                     continue
                 received += len(chunk)
                 if received > MAX_DOCUMENT_BYTES:
-                    raise DocumentError(
-                        f"the PDF is too large (max {MAX_DOCUMENT_BYTES // (1024 * 1024)} MB)"
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    limit = MAX_DOCUMENT_BYTES // (1024 * 1024)
+                    return _err(
+                        400,
+                        f"the PDF is too large (max {limit} MB)",
+                        "invalid_file",
                     )
                 handle.write(chunk)
         if received == 0:
-            raise DocumentError("the uploaded PDF is empty")
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return _err(400, "the uploaded PDF is empty", "invalid_file")
         os.replace(temporary, target)
-    except DocumentError as exc:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return _err(400, str(exc), "invalid_file")
     except OSError as exc:
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
-        return _err(500, f"could not store the upload: {exc}", "upload_failed")
+        return _fail(
+            500,
+            exc,
+            "storing the document upload",
+            "The PDF could not be stored. Check that the documents folder is writable and has free space.",
+            "upload_failed",
+        )
 
     try:
         from starlette.concurrency import run_in_threadpool
 
         job = await run_in_threadpool(ctx.documents.start, target, name)
     except DocumentError as exc:
-        return _err(400, str(exc), "document_error")
+        return _fail(
+            400,
+            exc,
+            "starting the document job",
+            "The PDF could not be analysed. Check that it is a valid, unencrypted PDF and that a vision model is installed.",
+            "document_error",
+        )
     except Exception as exc:
-        return _err(500, f"could not start the document job: {exc}", "document_error")
+        return _fail(
+            500,
+            exc,
+            "starting the document job",
+            "The document job could not start. See the app log for details.",
+            "document_error",
+        )
     return {"ok": True, "job": job, "bytes": received}
 
 
@@ -1223,7 +1511,13 @@ async def web_search(request: Request):
 
         results = await run_in_threadpool(ctx.web_search.search, query)
     except Exception as exc:
-        return _err(400, str(exc), "web_error")
+        return _fail(
+            400,
+            exc,
+            "running a web search",
+            "The web search failed. Check your connection and the search backend settings.",
+            "web_error",
+        )
     return {"data": results, "query": query}
 
 # ------------------------------------------------------------------------- requirements
@@ -1267,7 +1561,13 @@ async def requirements_install(component_id: str, request: Request):
     try:
         return await run_in_threadpool(ctx.requirements.install, component_id)
     except ValueError as exc:
-        return _err(400, str(exc), "install_error")
+        return _fail(
+            400,
+            exc,
+            "installing a setup component",
+            "That component cannot be installed. Check the component ID and the setup log.",
+            "install_error",
+        )
 
 
 @router.get("/requirements/{component_id}/log")
@@ -1298,7 +1598,13 @@ async def component_log(name: str, request: Request, lines: int = 200):
     try:
         data = path.read_bytes()[-512_000:]
     except OSError as exc:
-        return _err(500, f"could not read the log: {exc}", "log_error")
+        return _fail(
+            500,
+            exc,
+            "reading an app log",
+            "The log file could not be read. Check that the logs folder is readable.",
+            "log_error",
+        )
     text = data.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
     rows = [line for line in text.split("\n") if line.strip()]
     return {

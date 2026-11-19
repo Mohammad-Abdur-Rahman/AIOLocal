@@ -98,9 +98,20 @@ automatic routing. No new model or external service is required.
   IFD memory amplification).
 - Folder summaries are rebuilt automatically after a scan that adds documents.
 
+### Security
+
+- **API errors no longer echo exception text.** Internal failures are logged with
+  a traceback and every endpoint returns a short, curated message, so file
+  paths, library details and stack traces cannot leak to the browser
+  (`py/stack-trace-exposure`, CWE-209).
+- **DuckDuckGo redirect checks parse the host.** The result unwrapper compares
+  the URL hostname (`duckduckgo.com` or `*.duckduckgo.com`) instead of using a
+  substring test on the netloc, closing
+  `py/incomplete-url-substring-sanitization` (CWE-20).
+
 ### Validation
 
-- Full test suite: 141 passed.
+- Full test suite: 145 passed.
 - Corpus check on the reference library (385 documents, 6,072 chunks, 56
   folders): folder hit@3 100%, chunk hit@5 100%, negative control 100%.
 

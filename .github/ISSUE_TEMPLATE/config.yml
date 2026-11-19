@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Mohammad-Abdur-Rahman/AIOLocal/security/advisories/new
+    about: Please report vulnerabilities privately through a security advisory, not a public issue.
+  - name: Read the security policy and threat model
+    url: https://github.com/Mohammad-Abdur-Rahman/AIOLocal/blob/main/SECURITY.md
+    about: What the app defends against, and what is explicitly out of scope.
+  - name: Contributing guide
+    url: https://github.com/Mohammad-Abdur-Rahman/AIOLocal/blob/main/CONTRIBUTING.md
+    about: Development setup, tests, coding guidelines and the pull request process.

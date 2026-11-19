@@ -51,7 +51,7 @@ $exe = Join-Path $root "dist\AIOLocal\AIOLocal.exe"
 if (-not (Test-Path $exe)) { throw "Build finished but $exe is missing" }
 
 Write-Host "Adding licence and notices..." -ForegroundColor Cyan
-foreach ($doc in @("README.md", "NOTICE", "LICENSE", "SECURITY.md")) {
+foreach ($doc in @("README.md", "CHANGELOG.md", "NOTICE", "LICENSE", "SECURITY.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md")) {
     $source = Join-Path $root $doc
     if (Test-Path $source) {
         Copy-Item -Force $source (Join-Path $root "dist\AIOLocal\$doc")

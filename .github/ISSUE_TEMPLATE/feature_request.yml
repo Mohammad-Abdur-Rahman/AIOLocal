@@ -1,0 +1,80 @@
+name: Feature request
+description: Suggest a capability or improvement for AIO Local
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the problem first, then the change you have in mind. Check
+        the roadmap in the README and search existing requests before opening a
+        new one.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the workflow that is currently difficult or impossible.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should the app do? Include UI copy or API shape if relevant.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Chat and memory
+        - Documents and vision
+        - Knowledge base
+        - Models / OVMS
+        - Custom OpenVINO models
+        - Images and inpainting
+        - OpenCode
+        - REA
+        - GIMP dock
+        - Setup, packaging and platform support
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, other apps, or designs you rejected.
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware this would target
+      multiple: true
+      options:
+        - CPU
+        - Intel GPU
+        - Intel NPU
+        - Any / not hardware specific
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Mockups, links, sample files or constraints. Do not attach model weights.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and the README roadmap.
+          required: true
+        - label: This request is about local, on-device behaviour.
+          required: true

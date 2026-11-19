@@ -461,8 +461,8 @@ async def _prepare(
                         "knowledge_mode": "explicit",
                         "collections": slugs,
                     }
-        except Exception as exc:
-            kb_plan_extra = {"knowledge_error": f"{type(exc).__name__}: {exc}"[:300]}
+        except Exception:
+            kb_plan_extra = {"knowledge_error": "the knowledge search failed"}
 
     # Opt-in web search (per-message, never followed automatically)
     web_results: list[dict] = []
@@ -472,8 +472,8 @@ async def _prepare(
         try:
             web_results = ctx.web_search.search(user_text, limit=ctx.settings.web_search_max_results)
             web_plan_extra = {"web_search": len(web_results)}
-        except Exception as exc:
-            web_plan_extra = {"web_search": 0, "web_search_error": str(exc)[:400]}
+        except Exception:
+            web_plan_extra = {"web_search": 0, "web_search_error": "the web search failed"}
 
     result = retrieve(
         ctx.db,

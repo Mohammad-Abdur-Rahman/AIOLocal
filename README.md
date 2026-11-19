@@ -231,6 +231,11 @@ workspace\           code workspace
 
 See `SECURITY.md` for the threat model and reporting instructions.
 
+Contributions are welcome. Read `CONTRIBUTING.md` for the development setup,
+test rules and pull request process, and `CODE_OF_CONDUCT.md` for community
+expectations. Bug reports and feature requests use the issue forms in
+`.github/ISSUE_TEMPLATE`.
+
 ---
 
 ## Licence

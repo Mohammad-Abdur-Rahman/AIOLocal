@@ -187,7 +187,9 @@ class _DuckParser(HTMLParser):
             url = result.get("url") or ""
             try:
                 parts = urlsplit(url)
-                if parts.netloc.endswith("duckduckgo.com") and parts.path.startswith("/l/"):
+                host = (parts.hostname or "").lower()
+                official = host == "duckduckgo.com" or host.endswith(".duckduckgo.com")
+                if official and parts.path.startswith("/l/"):
                     target = parse_qs(parts.query).get("uddg", [""])[0]
                     if target:
                         result["url"] = target

@@ -1,0 +1,126 @@
+name: Bug report
+description: Report a reproducible problem in AIO Local
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve AIO Local. Please search existing issues first.
+
+        **Do not report security vulnerabilities here.** Use a
+        [private security advisory](https://github.com/Mohammad-Abdur-Rahman/AIOLocal/security/advisories/new)
+        instead. Remove tokens, prompts and personal file paths from logs before pasting.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A short, factual description of the problem.
+      placeholder: "Selecting a model in Chat did not change the model used by documents..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Number every step so the issue can be reproduced exactly.
+      placeholder: |
+        1. Open Models and load Qwen3.5 9B
+        2. Select it in the Chat dropdown
+        3. Upload a PDF in Documents
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour and error text
+      description: Paste the exact message, including any HTTP status code.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: AIO Local version
+      description: Shown in the app header or in Setup. Include the commit if you run from source.
+      placeholder: "0.2.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How are you running the app?
+      options:
+        - Windows release zip (AIOLocal.exe)
+        - From source (python -m aiolocal)
+        - Linux source build
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows / OS version
+      placeholder: "Windows 11 23H2 (22631.4317)"
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: CPU, GPU and NPU
+      description: Include the Intel CPU generation and GPU model.
+      placeholder: "Core Ultra 7 155H, Arc iGPU, Intel AI Boost NPU"
+    validations:
+      required: true
+
+  - type: textarea
+    id: models
+    attributes:
+      label: Models and OVMS involved
+      description: Which model IDs, devices and custom OpenVINO folders were in use?
+      placeholder: |
+        Chat model: qwen3.5-9b on GPU
+        Custom model: Ornith-1.0-9B-int4-symg128-ov (folder deleted)
+        OVMS: 2026.x at C:\Program Files\OpenVINO\ovms
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Paste the relevant tail of `%LOCALAPPDATA%\AIOLocal\logs\app.log` and
+        `ovms.log`. Remove prompts, tokens and personal paths.
+      render: text
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Drag images here. Crop out personal information.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I am running the latest release.
+          required: true
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I removed secrets, tokens and personal data from this report.
+          required: true

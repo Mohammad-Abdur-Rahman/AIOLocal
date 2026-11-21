@@ -15,6 +15,8 @@ from .db import Database
 from .events import EventBus
 from .llm import Upstream
 from .memory.jobs import MemoryWorker
+from .memory.treebuild import TreeBuilder
+from .tasks import ResponseTaskWorker
 from .models import ModelManager
 from .knowledge import KnowledgeBase, KnowledgeWorker
 from .websearch import WebSearch
@@ -37,6 +39,8 @@ class AppContext:
     token: str
     started_at: int = field(default_factory=lambda: int(time.time() * 1000))
     worker: MemoryWorker | None = None
+    trees: TreeBuilder | None = None
+    tasks: ResponseTaskWorker | None = None
     models: ModelManager | None = None
     kb: KnowledgeBase | None = None
     kb_worker: KnowledgeWorker | None = None
@@ -59,6 +63,16 @@ class AppContext:
     def close(self) -> None:
         if self.worker is not None:
             self.worker.stop()
+        if self.trees is not None:
+            try:
+                self.trees.stop()
+            except Exception:
+                pass
+        if self.tasks is not None:
+            try:
+                self.tasks.close()
+            except Exception:
+                pass
         if self.kb_worker is not None:
             try:
                 self.kb_worker.stop(timeout=3.0)

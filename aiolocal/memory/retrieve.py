@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import store, semantic
+from . import store, semantic, tree
 from .text import embed, estimate_tokens, keywords, normalise
 
 from ..config import Settings
@@ -29,6 +29,74 @@ MAX_SUMMARIES = 8
 MAX_EXACT_MESSAGES = 12
 EXPAND_PER_SUMMARY = 6
 GATE_NORMALISED = 0.06
+MAX_TREE_ITEMS = 6
+
+_PAGE_RANGE_RE = re.compile(
+    r"(?im)^\s*(?:pages?|p\.)\s*(\d+)(?:\s*[-–]\s*(\d+))?\s*$"
+)
+_PAGE_RANGE_INLINE_RE = re.compile(
+    r"(?i)\b(?:pages?|p\.)\s*(\d+)\s*(?:[-–]\s*(\d+))?\b"
+)
+
+
+def parse_page_refs(query: str) -> list[tuple[int, int]]:
+    """Extract explicit page references from a query.
+
+    Supports "page 12", "pages 3-5" and inline forms such as
+    "what does page 12 say about X". Ranges are normalised so the smaller
+    number comes first. Duplicates are removed while preserving order.
+    """
+    text = str(query or "")
+    refs: list[tuple[int, int]] = []
+    for match in _PAGE_RANGE_INLINE_RE.finditer(text):
+        first = int(match.group(1))
+        second = int(match.group(2)) if match.group(2) else first
+        low, high = (first, second) if first <= second else (second, first)
+        if low < 1:
+            continue
+        refs.append((low, high))
+    seen: set[tuple[int, int]] = set()
+    out: list[tuple[int, int]] = []
+    for ref in refs:
+        if ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+    return out
+
+
+def document_pages_range(
+    db: Database, document_id: str, first: int, last: int, *, limit: int = 50
+) -> list[MemoryItem]:
+    """Return exact page excerpts for a page range, bypassing vector thresholds."""
+    if not document_id:
+        return []
+    low, high = (first, last) if first <= last else (last, first)
+    low = max(1, low)
+    items: list[MemoryItem] = []
+    with db.read() as c:
+        rows = c.execute(
+            """SELECT p.page_no, p.text, p.created_at AS page_at, d.title
+               FROM document_pages p JOIN summaries d ON d.id=p.document_id
+               WHERE p.document_id=? AND p.page_no BETWEEN ? AND ?
+               ORDER BY p.page_no LIMIT ?""",
+            (document_id, low, high, max(1, min(int(limit), 200))),
+        ).fetchall()
+    for row in rows:
+        body = str(row["text"])[:6000]
+        items.append(
+            MemoryItem(
+                kind="document_page",
+                id=f"{document_id}:{int(row['page_no'])}",
+                title=f"{row['title']} — page {row['page_no']}",
+                body=body,
+                score=1.0,
+                created_at=int(row["page_at"] or 0),
+                salience=0.66,
+                tokens=estimate_tokens(body),
+                summary_kind="document_page",
+            )
+        )
+    return items
 
 _CONTINUATION_PHRASES = {
     "make it shorter", "make it longer", "again", "why", "why?", "continue", "go on",
@@ -228,11 +296,99 @@ DOCUMENT_WORDS = {
 }
 
 
+def _tree_items(
+    db: Database,
+    query: str,
+    *,
+    conversation_id: str | None,
+    document_ids: list[str] | None,
+    limit: int = MAX_TREE_ITEMS,
+) -> tuple[list[MemoryItem], list[list[str]]]:
+    """Back-trace chat and opted-in document trees.
+
+    Returns the items plus ``[[tree_id, node_id], ...]`` usage pairs so the
+    gateway can strengthen branches after the reply is actually delivered.
+    """
+    searches: list[tuple[str, str]] = []
+    if conversation_id:
+        chat = tree.tree_by_ref(db, kind="chat", ref_id=conversation_id)
+        if chat:
+            searches.append(("chat", str(chat["id"])))
+    for document_id in (document_ids or [])[:6]:
+        if not document_id:
+            continue
+        doc_tree = tree.tree_by_ref(db, kind="document", ref_id=str(document_id))
+        if doc_tree:
+            searches.append(("document", str(doc_tree["id"])))
+
+    items: list[MemoryItem] = []
+    usage: list[list[str]] = []
+    for kind, tree_id in searches:
+        try:
+            hits = tree.backtrace(db, tree_id, query, limit=limit)
+        except Exception:
+            continue
+        for hit in hits:
+            if hit.kind == "chunk":
+                if kind == "document" and hit.page_from:
+                    title = f"Document page {hit.page_from}"
+                    summary_kind = "tree_page"
+                else:
+                    title = "Exact exchange"
+                    summary_kind = "tree_chunk"
+                item_id = f"tree-chunk:{tree_id}:{hit.id}"
+            else:
+                title = f"Memory summary, degree {hit.degree}"
+                summary_kind = "tree_node"
+                item_id = f"tree-node:{hit.id}"
+                usage.append([tree_id, hit.id])
+            items.append(
+                MemoryItem(
+                    kind="summary",
+                    id=item_id,
+                    title=title,
+                    body=hit.body,
+                    score=hit.score,
+                    created_at=0,
+                    salience=0.6,
+                    tokens=hit.tokens or estimate_tokens(hit.body),
+                    summary_kind=summary_kind,
+                )
+            )
+
+    items.sort(key=lambda i: i.score, reverse=True)
+    # Keep at most `limit` items overall but never let one tree crowd out the
+    # other: they answer different questions.
+    return items[: max(1, limit)], usage
+
+
+def _norm_body(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()[:240]
+
+
+def _dedupe(items: list[MemoryItem]) -> list[MemoryItem]:
+    """Drop items whose text is already present, keeping the higher score.
+
+    Tree chunks duplicate the archived messages; injecting both wastes budget and
+    makes the model repeat itself.
+    """
+    best: dict[str, MemoryItem] = {}
+    for item in items:
+        key = _norm_body(item.body)
+        if not key:
+            continue
+        current = best.get(key)
+        if current is None or item.score > current.score:
+            best[key] = item
+    return sorted(best.values(), key=lambda i: i.score, reverse=True)
+
+
 def _document_items(
     db: Database,
     query: str,
     settings: Settings,
     *,
+    document_ids: list[str] | None = None,
     section_limit: int = 2,
     page_limit: int = 4,
 ) -> list[MemoryItem]:
@@ -240,16 +396,30 @@ def _document_items(
 
     The document summary is only an index now; the facts live in these rows. Page
     text is returned verbatim so the model can quote it instead of guessing from an
-    overview.
+    overview. ``document_ids`` scopes the search to documents this chat opted into;
+    ``None`` means unrestricted (Memory Inspector only).
     """
-    section_ids = _vector_lists(
-        db, "document_section", query, settings,
-        threshold=0.10, limit=60, cap=40_000,
-    )
-    page_ids = _vector_lists(
-        db, "document_page", query, settings,
-        threshold=0.14, limit=60, cap=80_000,
-    )
+    allowed = None if document_ids is None else {str(d) for d in document_ids}
+    if allowed is not None and not allowed:
+        return []
+
+    def permitted(doc_id: str) -> bool:
+        return allowed is None or doc_id in allowed
+
+    section_ids = [
+        key for key in _vector_lists(
+            db, "document_section", query, settings,
+            threshold=0.10, limit=60, cap=40_000,
+        )
+        if permitted(key.split(":", 1)[0])
+    ]
+    page_ids = [
+        key for key in _vector_lists(
+            db, "document_page", query, settings,
+            threshold=0.14, limit=60, cap=80_000,
+        )
+        if permitted(key.split(":", 1)[0])
+    ]
     items: list[MemoryItem] = []
     seen_sections: set[str] = set()
     seen_pages: set[str] = set()
@@ -371,6 +541,7 @@ def retrieve(
     exclude_message_ids: set[str] | None = None,
     request_id: str | None = None,
     force_lookup: bool = False,
+    document_ids: list[str] | None = None,
 ) -> RetrievalResult:
     t0 = time.perf_counter()
     q = normalise(query)
@@ -458,9 +629,18 @@ def retrieve(
     plan["gate"] = round(top_raw / max_possible, 4) if max_possible else 0.0
 
     ordered: list[MemoryItem] = []
+    allowed_docs = None if document_ids is None else {str(d) for d in document_ids}
     for sid, rrf in sorted(fused_summary.items(), key=lambda kv: kv[1], reverse=True):
         row = summary_rows.get(sid)
         if not row:
+            continue
+        # Document memory is opt-in per chat: a document summary is never
+        # injected unless the user attached that document to this conversation.
+        if (
+            str(row.get("kind") or "") == "document"
+            and allowed_docs is not None
+            and sid not in allowed_docs
+        ):
             continue
         salience = float(row.get("salience") or 0.5)
         score = rrf * (0.75 + 0.25 * salience) * _recency_boost(int(row.get("created_at") or 0))
@@ -487,16 +667,67 @@ def retrieve(
 
     # Documents are stored as pages + sections. Pull exact excerpts when the query
     # is document-shaped, or whenever a document summary was already retrieved.
+    # Explicit page references ("pages 3-5", "page 12") resolve directly and
+    # bypass the similarity thresholds, so page-number queries are exact.
     doc_items: list[MemoryItem] = []
     try:
         words = set(re.findall(r"[a-z]+", q.lower()))
         has_doc = any(i.summary_kind == "document" for i in ordered)
-        if has_doc or (words & DOCUMENT_WORDS):
-            doc_items = _document_items(db, q, settings)
+        page_refs = parse_page_refs(q)
+        # An explicit page reference is a direct lookup, not a similarity
+        # search: it must resolve even when no summary matched the wording.
+        if page_refs:
+            doc_ids = [
+                i.id for i in ordered
+                if i.summary_kind == "document" or str(i.id).startswith("doc:")
+            ]
+            if not doc_ids:
+                # Fall back to the most recent *attached* document when the
+                # query names pages but no document summary matched the text.
+                candidates = allowed_docs
+                if candidates is None:
+                    candidates = {
+                        str(r["id"])
+                        for r in store.list_summaries(db, limit=50)
+                        if str(r.get("kind") or "") == "document"
+                    }
+                doc_ids = list(candidates)[:3]
+            seen_pages: set[str] = set()
+            for doc_id in doc_ids[:3]:
+                if allowed_docs is not None and doc_id not in allowed_docs:
+                    continue
+                for low, high in page_refs:
+                    for item in document_pages_range(db, doc_id, low, high):
+                        if item.id not in seen_pages:
+                            seen_pages.add(item.id)
+                            doc_items.append(item)
+            if doc_items:
+                plan["sources"]["document_pages_explicit"] = [i.id for i in doc_items]
+        if (not doc_items) and (has_doc or (words & DOCUMENT_WORDS)):
+            doc_items = _document_items(db, q, settings, document_ids=document_ids)
             if doc_items:
                 plan["sources"]["document"] = [i.id for i in doc_items]
     except Exception as exc:  # pragma: no cover - defensive
         plan["sources"]["document_error"] = str(exc)[:200]
+
+    # Append-only tree memory: back-trace from the query through the summary
+    # levels down to exact chunks. This is the primary long-term path; the flat
+    # ranked lists above remain as a fallback for summaries and direct hits.
+    tree_items: list[MemoryItem] = []
+    try:
+        tree_items, tree_usage = _tree_items(
+            db,
+            q,
+            conversation_id=conversation_id,
+            document_ids=document_ids,
+            limit=MAX_TREE_ITEMS,
+        )
+        if tree_items:
+            plan["sources"]["tree"] = [i.id for i in tree_items]
+        if tree_usage:
+            plan["tree_usage"] = tree_usage
+    except Exception as exc:  # pragma: no cover - defensive
+        plan["sources"]["tree_error"] = str(exc)[:200]
 
     # Expand the messages behind the selected summaries, plus direct message hits.
     expand_ids: list[str] = []
@@ -515,7 +746,7 @@ def retrieve(
         except Exception as exc:  # pragma: no cover
             plan["exact_error"] = str(exc)[:200]
 
-    items = doc_items + exact_items + ordered
+    items = _dedupe(tree_items + doc_items + exact_items + ordered)
     plan["selected"] = [i.to_dict() for i in items]
     latency = int((time.perf_counter() - t0) * 1000)
     plan["latency_ms"] = latency

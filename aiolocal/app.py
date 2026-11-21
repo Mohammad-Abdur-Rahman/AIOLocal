@@ -23,6 +23,8 @@ from .control import router as control_router
 from .images import router as images_router
 from .llm import Upstream
 from .memory.jobs import MemoryWorker
+from .memory.treebuild import TreeBuilder
+from .tasks import ResponseTaskWorker
 from .models import ModelManager
 from .knowledge import KnowledgeBase, KnowledgeWorker
 from .websearch import WebSearch
@@ -110,6 +112,8 @@ def create_app(
             repaired_models = False
             log.exception("could not repair model references in settings")
         worker = MemoryWorker(db, settings, on_event=bus.publish)
+        trees = TreeBuilder(db, settings_store)
+        tasks = ResponseTaskWorker(paths, settings_store, db, publish=bus.publish)
         requirements = RequirementsManager(paths, settings_store, publish=bus.publish)
         kb = None
         kb_worker = None
@@ -152,7 +156,9 @@ def create_app(
             return path
 
         gimp = GimpDock(paths, settings_store, image_lookup=lookup_image)
-        documents = DocumentAnalyzer(paths, settings_store, db, publish=bus.publish, models=models)
+        documents = DocumentAnalyzer(
+            paths, settings_store, db, publish=bus.publish, models=models, trees=trees
+        )
         ctx = AppContext(
             paths=paths,
             settings_store=settings_store,
@@ -162,6 +168,8 @@ def create_app(
             bus=bus,
             token=token,
             worker=worker,
+            trees=trees,
+            tasks=tasks,
             models=models,
             kb=kb,
             kb_worker=kb_worker,
@@ -175,6 +183,16 @@ def create_app(
         )
         app.state.ctx = ctx
         worker.start()
+        # Upgrade path: conversations and documents stored before tree memory
+        # existed enter their trees once, in the background, without blocking
+        # startup. Re-running is a no-op because chunks are keyed.
+        def _backfill_trees() -> None:
+            try:
+                trees.backfill()
+            except Exception:
+                log.exception("tree backfill failed")
+
+        threading.Thread(target=_backfill_trees, name="tree-backfill", daemon=True).start()
         log.info("AIO Local %s started; data=%s", __version__, paths.data_dir)
 
         # Start OVMS in the background when models are already selected, unless an
@@ -229,6 +247,14 @@ def create_app(
                 documents.close()
             except Exception:
                 log.exception("failed to stop document jobs")
+            try:
+                trees.stop()
+            except Exception:
+                log.exception("failed to stop the memory tree builder")
+            try:
+                tasks.close()
+            except Exception:
+                log.exception("failed to stop task drafting")
             try:
                 models.stop_ovms()
             except Exception:

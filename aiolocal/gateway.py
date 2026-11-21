@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import AsyncIterator
 
 import httpx
@@ -20,9 +21,11 @@ from .context import AppContext
 from .llm import UpstreamError
 from .memory import store, semantic
 from .memory.assemble import InputTooLarge, assemble
+from .memory import treebuild, tree
 from .memory.retrieve import retrieve
 from .memory.text import content_hash, new_id, normalise, truncate_tokens
 from .security import valid_id
+from .tasks import looks_like_bulk_task
 
 router = APIRouter()
 
@@ -321,6 +324,23 @@ def _archive_assistant(
     return message_id, inserted
 
 
+def _record_tree_usage(ctx: AppContext, plan: dict) -> None:
+    """Strengthen the tree branches a delivered reply actually used."""
+    pairs = plan.get("tree_usage") or []
+    if not pairs:
+        return
+    grouped: dict[str, list[str]] = {}
+    for pair in pairs:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        grouped.setdefault(str(pair[0]), []).append(str(pair[1]))
+    for tree_id, node_ids in grouped.items():
+        try:
+            tree.record_usage(ctx.db, tree_id, node_ids)
+        except Exception:
+            pass
+
+
 def _enqueue_filing(
     ctx: AppContext,
     *,
@@ -330,6 +350,23 @@ def _enqueue_filing(
     user_text: str,
     assistant_text: str,
 ) -> None:
+    # Tree memory is written synchronously (one cheap row) so the exchange is
+    # immediately retrievable. The roll-up into summaries runs on a background
+    # thread and never blocks the reply.
+    if ctx.trees is not None:
+        try:
+            tree_id = treebuild.append_exchange(
+                ctx.db,
+                conversation_id=conversation_id,
+                request_id=user_message_id,
+                user_text=user_text,
+                assistant_text=assistant_text,
+                user_message_id=user_message_id,
+                assistant_message_id=assistant_message_id,
+            )
+            ctx.trees.kick(tree_id)
+        except Exception:
+            pass
     if ctx.worker is None:
         return
     ctx.worker.enqueue_file_turn(
@@ -483,6 +520,7 @@ async def _prepare(
         exclude_message_ids=exclude,
         request_id=request_id,
         force_lookup=(headers.get("x-aio-memory-lookup") == "1"),
+        document_ids=store.conversation_documents(ctx.db, conversation_id),
     )
 
     mode = str(request.headers.get("x-aio-mode") or "chat").lower()
@@ -548,6 +586,156 @@ async def _prepare(
     return payload, conversation_id, request_id, user_msg_id, user_text, tool_chain, plan
 
 
+def _bulk_pages(ctx: AppContext, document_ids: list[str]) -> int:
+    if not document_ids:
+        return 0
+    marks = ",".join("?" * len(document_ids))
+    with ctx.db.read() as c:
+        row = c.execute(
+            f"SELECT COUNT(*) FROM document_pages WHERE document_id IN ({marks})",
+            tuple(document_ids),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _maybe_start_task(
+    ctx: AppContext, body: dict, request: Request, messages: list[dict]
+):
+    """Route an explicitly exhaustive, document-wide job to the drafting worker.
+
+    Normal questions must stay single-shot. This triggers only for a bulk verb +
+    exhaustive phrase over at least 20 analysed pages, or an explicit
+    ``x-aio-task: 1`` header.
+    """
+    if ctx.tasks is None:
+        return None
+    if not isinstance(body, dict):
+        return None
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    if headers.get("x-aio-task") == "0":
+        return None
+    user_text, _ = _last_user(messages)
+    if not user_text.strip():
+        return None
+    conversation_id = resolve_conversation(ctx, body, request.headers)
+    document_ids = store.conversation_documents(ctx.db, conversation_id)
+    forced = headers.get("x-aio-task") == "1"
+    if not forced and not looks_like_bulk_task(
+        user_text, total_pages=_bulk_pages(ctx, document_ids)
+    ):
+        return None
+    if not document_ids:
+        return None
+    topics = [
+        line.strip(" -•\t")
+        for line in user_text.splitlines()
+        if line.strip().startswith(("-", "•")) and len(line.strip()) > 2
+    ][:40]
+    request_id = new_id()
+    user_msg_id, _ = store.archive_message(
+        ctx.db,
+        conversation_id=conversation_id,
+        role="user",
+        content=user_text,
+        source="api",
+        request_id=request_id,
+        embed_dim=ctx.settings.embed_dim,
+    )
+    try:
+        task = ctx.tasks.start(
+            conversation_id=conversation_id,
+            instruction=user_text,
+            topics=topics,
+            document_ids=document_ids,
+            model=str(body.get("model") or ""),
+            title=user_text.strip().splitlines()[0][:100],
+        )
+    except Exception as exc:
+        return _error(409, f"could not start the task ({exc})", "task_unavailable")
+
+    content = (
+        "I started a working draft for this long task because it covers more pages "
+        "than one reply can hold.\n\n"
+        f"**Task id:** `{task['id']}`\n"
+        f"**Scope:** {task['total_units']} units across {len(document_ids)} attached "
+        "document(s).\n\n"
+        "The draft is written in ordered sections and appended as it goes. It is "
+        "never rewritten, so nothing already completed is lost. You can follow the "
+        "progress in the task card, pause or cancel it, and read the finished draft "
+        "when it is done."
+    )
+    assistant_id, _ = store.archive_message(
+        ctx.db,
+        conversation_id=conversation_id,
+        role="assistant",
+        content=content,
+        source="api",
+        request_id=request_id,
+        meta={"model": "", "task_id": task["id"]},
+        embed_dim=ctx.settings.embed_dim,
+    )
+    _enqueue_filing(
+        ctx,
+        conversation_id=conversation_id,
+        user_message_id=user_msg_id,
+        assistant_message_id=assistant_id,
+        user_text=user_text,
+        assistant_text=content,
+    )
+    model = str(body.get("model") or "")
+    headers = {**plan_headers(conversation_id, request_id), "X-AIO-Task": task["id"]}
+    if body.get("stream", False):
+        return StreamingResponse(
+            _task_stream(content, task, request_id, model),
+            media_type="text/event-stream",
+            headers={
+                **headers,
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    return JSONResponse(
+        content={
+            "id": f"chatcmpl-{request_id}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "task": task,
+        },
+        headers=headers,
+    )
+
+
+async def _task_stream(
+    content: str, task: dict, request_id: str, model: str
+) -> AsyncIterator[str]:
+    """Emit the task acknowledgement as an OpenAI-compatible SSE stream."""
+    created = int(time.time())
+
+    def frame(delta: dict, finish: str | None = None) -> str:
+        body = {
+            "id": f"chatcmpl-{request_id}",
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        return f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
+
+    yield frame({"role": "assistant"})
+    for start in range(0, len(content), 160):
+        yield frame({"content": content[start : start + 160]})
+    yield frame({}, "stop")
+    yield "data: [DONE]\n\n"
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     ctx: AppContext = request.app.state.ctx
@@ -562,6 +750,11 @@ async def chat_completions(request: Request):
 
     if classification in ("side", "probe"):
         return await _passthrough(ctx, body)
+
+    if isinstance(messages, list):
+        task_response = _maybe_start_task(ctx, body, request, messages)
+        if task_response is not None:
+            return task_response
 
     prepared = await _prepare(ctx, body, request)
     if isinstance(prepared, JSONResponse):
@@ -635,6 +828,7 @@ async def chat_completions(request: Request):
         user_text=user_text,
         assistant_text=content,
     )
+    _record_tree_usage(ctx, plan)
     return JSONResponse(
         content=data,
         headers={
@@ -701,6 +895,7 @@ async def _stream_and_archive(
                 user_text=user_text,
                 assistant_text=content,
             )
+            _record_tree_usage(ctx, plan)
         ctx.bus.publish(
             "chat_done",
             {

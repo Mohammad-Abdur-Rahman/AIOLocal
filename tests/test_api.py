@@ -488,3 +488,53 @@ def test_chat_model_setting_updates_the_opencode_config(client, env):
     assert "opencode_config" in body
     config = json.loads((env["paths"].config_dir / "opencode.json").read_text(encoding="utf-8"))
     assert config["model"] == "aiolocal/qwen3-4b"
+
+def test_a_bulk_document_job_streams_an_acknowledgement_and_starts_a_task(env):
+    db = env["app"].state.ctx.db
+    document_id = store.insert_summary(
+        db,
+        title="Document: Questions",
+        body="# Questions",
+        topic_slug="documents",
+        kind="document",
+        source="document",
+    )
+    with db.write() as c:
+        for page in range(1, 25):
+            c.execute(
+                """INSERT INTO document_pages(document_id, page_no, text, tokens, created_at)
+                   VALUES(?,?,?,?,?)""",
+                (document_id, page, f"Question {page} about topic {page % 3}", 8, 1),
+            )
+    store.attach_document(db, "bulk-chat", document_id)
+
+    response = env["client"].post(
+        "/v1/chat/completions",
+        headers=hdr(env, **{"X-AIO-Conversation": "bulk-chat"}),
+        json={
+            "model": "fake-model",
+            "stream": True,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Categorise every question in this document by topic",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    task_id = response.headers.get("X-AIO-Task")
+    assert task_id
+    # The client still receives a normal SSE completion, not a bare JSON object.
+    assert "data: [DONE]" in response.text
+    assert "working draft" in response.text
+
+    tasks_response = env["client"].get(
+        f"/api/v1/tasks?conversation_id=bulk-chat", headers=hdr(env)
+    )
+    assert "data" in tasks_response.json(), tasks_response.text
+    tasks = tasks_response.json()["data"]
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == task_id
+    assert tasks[0]["total_units"] == 24

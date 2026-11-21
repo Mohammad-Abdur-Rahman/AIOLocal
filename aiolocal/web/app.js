@@ -18,6 +18,8 @@
     chatImage: null,
     chatDocJob: null,
     chatDocTimer: null,
+    chatTask: null,
+    taskTimer: null,
     selectedImage: null,
     gallery: [],
     view: "chat",
@@ -76,6 +78,10 @@
       document_section: "section summaries",
       exact: "exact excerpts",
       history: "history excerpts",
+      tree_node: "tree summaries",
+      tree_chunk: "tree exchanges",
+      tree_page: "tree page notes",
+      task: "task drafts",
     }[kind] || String(kind || "memory items").replace(/_/g, " ");
   }
 
@@ -429,6 +435,7 @@
           meta.innerHTML = `<span class="muted small">${escapeHtml(fmtDate(row.created_at))}</span>`;
         }
       }
+      attachActiveTask();
     } catch (err) {
       toast(err.message, true);
     }
@@ -783,12 +790,24 @@
       done: "Saved to memory.",
       error: `Failed: ${job.error || "unknown error"}`,
       cancelled: "Cancelled. Finished pages are kept.",
-      interrupted: `Paused at page ${done}/${total || "?"}. It resumes when the app restarts.`,
+      paused: `Paused at page ${done}/${total || "?"}. Resume when ready.`,
+      interrupted: `Interrupted at page ${done}/${total || "?"}. It resumes when the app restarts.`,
     }[job.state] || job.state;
     $("#chat-doc-status").textContent = stateText;
+    const pause = $("#chat-doc-pause");
+    if (pause) {
+      pause.classList.toggle("hidden", !["queued", "running"].includes(job.state));
+    }
+    const resume = $("#chat-doc-resume");
+    if (resume) {
+      resume.classList.toggle("hidden", !["paused", "interrupted"].includes(job.state));
+    }
     const cancel = $("#chat-doc-cancel");
     if (cancel) {
-      cancel.classList.toggle("hidden", !["queued", "running"].includes(job.state));
+      cancel.classList.toggle(
+        "hidden",
+        !["queued", "running", "paused"].includes(job.state)
+      );
     }
     const hide = $("#chat-doc-hide");
     if (hide) {
@@ -814,6 +833,31 @@
     try {
       await api(`/documents/jobs/${encodeURIComponent(job.id)}/cancel`, { method: "POST" });
       toast("Cancelling after the current page.");
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  async function pauseDocumentJob() {
+    const job = state.chatDocJob;
+    if (!job || !job.id) return;
+    try {
+      await api(`/documents/jobs/${encodeURIComponent(job.id)}/pause`, { method: "POST" });
+      toast("Paused. Finished pages are kept.");
+      pollDocumentJob();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  async function resumeDocumentJob() {
+    const job = state.chatDocJob;
+    if (!job || !job.id) return;
+    try {
+      await api(`/documents/jobs/${encodeURIComponent(job.id)}/resume`, { method: "POST" });
+      toast("Resuming from the next unread page.");
+      state.chatDocTimer = setInterval(pollDocumentJob, 1500);
+      pollDocumentJob();
     } catch (err) {
       toast(err.message, true);
     }
@@ -857,7 +901,7 @@
       const current = await api(`/documents/jobs/${encodeURIComponent(job.id)}`);
       state.chatDocJob = current;
       renderDocumentJob(current);
-      if (["done", "error", "cancelled", "interrupted"].includes(current.state)) {
+      if (["done", "error", "cancelled", "interrupted", "paused"].includes(current.state)) {
         stopDocumentPolling();
         if (current.state === "done") {
           appendDocumentMemory(current);
@@ -907,7 +951,156 @@
     }
   }
 
-  /* ------------------------------------------------------------ images */
+  /* ------------------------------------------------- document memory scope */
+  function renderDocumentScope(rows) {
+    const list = $("#chat-doc-scope-list");
+    if (!list) return;
+    if (!rows.length) {
+      list.innerHTML = '<p class="muted small">No analysed documents yet. Use Add document first.</p>';
+      return;
+    }
+    list.innerHTML = rows.map((doc) => {
+      const label = `${escapeHtml(doc.title)}${doc.pages_total ? ` (${doc.pages_done}/${doc.pages_total} pages)` : ""}`;
+      const state = doc.partial ? " · partial" : "";
+      return `<label class="check scope-row"><input type="checkbox" data-doc-scope="${escapeAttr(doc.id)}" ${doc.attached ? "checked" : ""}> <span>${label}${state}</span></label>`;
+    }).join("");
+  }
+
+  async function refreshDocumentScope() {
+    if (!state.conversationId) {
+      renderDocumentScope([]);
+      return;
+    }
+    try {
+      const payload = await api(`/documents/options?conversation_id=${encodeURIComponent(state.conversationId)}`);
+      renderDocumentScope(payload.data || []);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  async function toggleDocumentScope(input) {
+    if (!state.conversationId) return;
+    const documentId = input.getAttribute("data-doc-scope");
+    const method = input.checked ? "POST" : "DELETE";
+    try {
+      await api(
+        `/documents/scope/${encodeURIComponent(documentId)}?conversation_id=${encodeURIComponent(state.conversationId)}`,
+        { method }
+      );
+      toast(input.checked ? "Document added to this chat's memory." : "Document removed from this chat.");
+      refreshState();
+    } catch (err) {
+      input.checked = !input.checked;
+      toast(err.message, true);
+    }
+  }
+
+  function showDocumentScope(show) {
+    const panel = $("#chat-doc-scope");
+    if (!panel) return;
+    panel.classList.toggle("hidden", !show);
+    if (show) refreshDocumentScope();
+  }
+
+  /* --------------------------------------------------------- long task card */
+  function renderTask(task) {
+    const box = $("#chat-task");
+    if (!box || !task) return;
+    box.classList.remove("hidden");
+    $("#chat-task-name").textContent = task.title || "Long task";
+    const total = Number(task.total_units || 0);
+    const done = Number(task.cursor || 0);
+    const pct = total ? Math.max(2, Math.min(100, Math.round((done / total) * 100))) : 2;
+    $("#chat-task-bar").style.width = `${pct}%`;
+    const stateText = {
+      queued: "Queued…",
+      running: `Drafting ${done} of ${total || "?"} units`,
+      paused: `Paused at ${done}/${total || "?"}. The draft is saved.`,
+      interrupted: `Interrupted at ${done}/${total || "?"}. It resumes when the app restarts.`,
+      done: `Draft complete (${done}/${total || "?"} units).`,
+      error: `Failed: ${task.error || "unknown error"}`,
+      cancelled: `Cancelled at ${done}/${total || "?"}. The draft is kept.`,
+    }[task.state] || task.state;
+    $("#chat-task-status").textContent = stateText;
+    const pause = $("#chat-task-pause");
+    if (pause) pause.classList.toggle("hidden", !["queued", "running"].includes(task.state));
+    const resume = $("#chat-task-resume");
+    if (resume) resume.classList.toggle("hidden", !["paused", "interrupted", "error"].includes(task.state));
+    const cancel = $("#chat-task-cancel");
+    if (cancel) cancel.classList.toggle("hidden", !["queued", "running", "paused"].includes(task.state));
+    const open = $("#chat-task-open");
+    if (open) {
+      const ready = ["done", "cancelled", "paused", "interrupted", "error"].includes(task.state)
+        || Number(task.cursor || 0) > 0;
+      open.classList.toggle("hidden", !ready);
+    }
+  }
+
+  function stopTaskPolling() {
+    if (state.taskTimer) {
+      clearInterval(state.taskTimer);
+      state.taskTimer = null;
+    }
+  }
+
+  async function pollTask() {
+    const task = state.chatTask;
+    if (!task || !task.id) { stopTaskPolling(); return; }
+    try {
+      const current = await api(`/tasks/${encodeURIComponent(task.id)}`);
+      state.chatTask = current;
+      renderTask(current);
+      if (["done", "error", "cancelled", "interrupted"].includes(current.state)) {
+        stopTaskPolling();
+        if (current.state === "done") {
+          toast("Long task draft is ready.");
+          refreshState();
+        } else if (current.state === "error") {
+          toast(current.error || "The task failed.", true);
+        }
+      }
+    } catch (err) {
+      stopTaskPolling();
+      toast(err.message, true);
+    }
+  }
+
+  async function attachActiveTask() {
+    if (!state.conversationId) return;
+    try {
+      const payload = await api(`/tasks?conversation_id=${encodeURIComponent(state.conversationId)}&limit=5`);
+      const rows = payload.data || [];
+      const task = rows.find((t) => ["queued", "running", "paused", "interrupted", "error"].includes(t.state));
+      if (!task) return;
+      state.chatTask = task;
+      renderTask(task);
+      if (["queued", "running"].includes(task.state) && !state.taskTimer) {
+        state.taskTimer = setInterval(pollTask, 2000);
+      }
+    } catch { /* the card is optional */ }
+  }
+
+  async function openTaskDraft() {
+    const task = state.chatTask;
+    if (!task || !task.id) return;
+    try {
+      const draft = await api(`/tasks/${encodeURIComponent(task.id)}/draft`);
+      const body = draft.chunks && draft.chunks.length
+        ? draft.text
+        : "_No sections have been written yet._";
+      openModal(`
+        <h2>${escapeHtml(task.title || "Task draft")}</h2>
+        <p class="muted small">${Number(task.cursor || 0)} of ${Number(task.total_units || 0)} units · state: ${escapeHtml(task.state)}</p>
+        <div class="draft-body">${renderMarkdown(body || "")}</div>
+      `);
+      typesetMath($("#modal-body"));
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+
   async function refreshGallery() {
     try {
       const payload = await api("/images");
@@ -1027,10 +1220,11 @@
   async function refreshMemory() {
     renderMemoryStats();
     try {
-      const [topics, summaries, jobs] = await Promise.all([
+      const [topics, summaries, jobs, trees] = await Promise.all([
         api("/memory/topics"),
         api("/memory/summaries?limit=60"),
         api("/memory/jobs?limit=40"),
+        api("/memory/trees?limit=40"),
       ]);
 
       const select = $("#mem-topic");
@@ -1041,7 +1235,73 @@
 
       renderSummaries(summaries.data || []);
       renderJobs(jobs.data || []);
+      renderTreeSelect(trees.data || []);
     } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  function renderTreeSelect(rows) {
+    const select = $("#tree-select");
+    if (!select) return;
+    const current = select.value;
+    select.innerHTML = '<option value="">Choose a tree</option>' +
+      rows.map((t) => `<option value="${escapeAttr(t.id)}">${escapeHtml(t.kind)} · ${escapeHtml(t.title || t.id)} (${Number(t.node_count || 0)} nodes)</option>`).join("");
+    if (current) select.value = current;
+    if (!rows.length) {
+      $("#tree-detail").innerHTML = '<p class="muted small">No trees yet. One is created for each chat and each analysed document.</p>';
+      return;
+    }
+    if (select.value) refreshTreeDetail(select.value);
+  }
+
+  async function refreshTreeDetail(treeId) {
+    const box = $("#tree-detail");
+    if (!box) return;
+    if (!treeId) {
+      box.innerHTML = "";
+      return;
+    }
+    box.innerHTML = '<p class="muted small">Loading tree…</p>';
+    try {
+      const detail = await api(`/memory/trees/${encodeURIComponent(treeId)}`);
+      const stats = detail.stats || {};
+      const nodes = detail.nodes || [];
+      const chunks = detail.chunks || [];
+      const byDegree = {};
+      for (const node of nodes) {
+        (byDegree[node.degree] = byDegree[node.degree] || []).push(node);
+      }
+      const degrees = Object.keys(byDegree).map(Number).sort((a, b) => b - a);
+      const nodeHtml = degrees.length
+        ? degrees.map((degree) => `
+            <details class="tree-level" ${degree === degrees[0] ? "open" : ""}>
+              <summary>degree ${degree} · ${byDegree[degree].length} nodes</summary>
+              ${byDegree[degree].map((node) => `
+                <div class="tree-node">
+                  <div class="tree-node-head">
+                    <span class="badge">${node.page_from ? `pages ${node.page_from}-${node.page_to}` : `${node.children.length} children`}</span>
+                    <span class="muted small">relevance ${Number(node.relevance || 0).toFixed(2)}</span>
+                  </div>
+                  <div class="result-body">${escapeHtml(String(node.summary || "").slice(0, 600))}</div>
+                </div>`).join("")}
+            </details>`).join("")
+        : '<p class="muted small">No summaries yet. Groups of 3 complete chunks roll up automatically.</p>';
+      const chunkHtml = chunks.length
+        ? `<details class="tree-level"><summary>chunks · showing ${chunks.length}</summary>
+            ${chunks.map((chunk) => `
+              <div class="tree-chunk">
+                <span class="badge">${chunk.ordinal + 1}</span>
+                <span class="${chunk.consumed ? "muted" : ""}">${escapeHtml(chunk.text || "")}</span>
+              </div>`).join("")}
+          </details>`
+        : "";
+      box.innerHTML = `
+        <p class="muted small">${Number(stats.chunks || 0)} chunks (${Number(stats.chunks_complete || 0)} complete) · ${Number(stats.nodes || 0)} summaries · depth ${Number(stats.depth || 0)} · ${Number(stats.chunks_unrolled || 0)} waiting to roll up.</p>
+        ${nodeHtml}
+        ${chunkHtml}`;
+    } catch (err) {
+      box.innerHTML = "";
       toast(err.message, true);
     }
   }
@@ -1121,7 +1381,7 @@
         rows.map((r) => `
           <div class="result">
             <div class="result-head">
-              <span class="badge">${escapeHtml(r.kind)}</span>
+              <span class="badge">${escapeHtml(r.summary_kind || r.kind)}</span>
               <strong>${escapeHtml(r.title)}</strong>
               <span class="muted small grow">score ${Number(r.score || 0).toFixed(4)}${r.topic ? " · " + escapeHtml(r.topic) : ""}</span>
             </div>
@@ -2675,6 +2935,29 @@
       if (state.view === "memory") refreshMemory();
       refreshState();
     });
+    source.addEventListener("response_task", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (state.chatTask && state.chatTask.id !== data.id) return;
+        if (!state.chatTask && data.conversation_id !== state.conversationId) return;
+        state.chatTask = data;
+        renderTask(data);
+        if (["queued", "running"].includes(data.state) && !state.taskTimer) {
+          state.taskTimer = setInterval(pollTask, 2000);
+        }
+        if (["done", "error", "cancelled", "interrupted"].includes(data.state)) {
+          stopTaskPolling();
+        }
+      } catch { /* progress is optional */ }
+    });
+    source.addEventListener("document_job", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (!state.chatDocJob || state.chatDocJob.id !== data.id) return;
+        state.chatDocJob = data;
+        renderDocumentJob(data);
+      } catch { /* progress is optional */ }
+    });
     source.addEventListener("job_failed", () => {
       if (state.view === "memory") refreshMemory();
     });
@@ -2757,7 +3040,40 @@
     $("#chat-attachment-remove").addEventListener("click", clearChatImage);
     $("#chat-add-document").addEventListener("click", () => $("#chat-document-input").click());
     $("#chat-doc-cancel").addEventListener("click", cancelDocumentJob);
+    $("#chat-doc-pause").addEventListener("click", pauseDocumentJob);
+    $("#chat-doc-resume").addEventListener("click", resumeDocumentJob);
     $("#chat-doc-hide").addEventListener("click", hideDocumentJob);
+    $("#chat-doc-scope-toggle").addEventListener("click", () => showDocumentScope($("#chat-doc-scope").classList.contains("hidden")));
+    $("#chat-doc-scope-close").addEventListener("click", () => showDocumentScope(false));
+    $("#chat-doc-scope-list").addEventListener("change", (event) => {
+      const input = event.target.closest("[data-doc-scope]");
+      if (input) toggleDocumentScope(input);
+    });
+    $("#chat-task-pause").addEventListener("click", async () => {
+      if (!state.chatTask) return;
+      try {
+        await api(`/tasks/${encodeURIComponent(state.chatTask.id)}/pause`, { method: "POST" });
+        pollTask();
+      } catch (err) { toast(err.message, true); }
+    });
+    $("#chat-task-resume").addEventListener("click", async () => {
+      if (!state.chatTask) return;
+      try {
+        await api(`/tasks/${encodeURIComponent(state.chatTask.id)}/resume`, { method: "POST" });
+        state.taskTimer = setInterval(pollTask, 2000);
+        pollTask();
+      } catch (err) { toast(err.message, true); }
+    });
+    $("#chat-task-cancel").addEventListener("click", async () => {
+      if (!state.chatTask) return;
+      try {
+        await api(`/tasks/${encodeURIComponent(state.chatTask.id)}/cancel`, { method: "POST" });
+        toast("Cancelling after the current section.");
+        pollTask();
+      } catch (err) { toast(err.message, true); }
+    });
+    $("#chat-task-open").addEventListener("click", openTaskDraft);
+    $("#tree-select").addEventListener("change", (event) => refreshTreeDetail(event.target.value));
     $("#chat-document-input").addEventListener("change", (event) => {
       const file = event.target.files && event.target.files[0];
       if (file) startDocumentAnalysis(file);

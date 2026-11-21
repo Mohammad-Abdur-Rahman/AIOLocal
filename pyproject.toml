@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiolocal"
-version = "0.2.1"
+version = "0.3.0"
 description = "Local, memory-first AI workspace for Intel hardware (OpenVINO / OVMS)."
 readme = "README.md"
 requires-python = ">=3.11"

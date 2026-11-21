@@ -119,7 +119,7 @@ contributing you agree that your contribution is licensed under the project's
 
 ## Release checklist (maintainers)
 
-This is the process used for `0.2.1`:
+This is the process used for `0.3.0`:
 
 1. Update `__version__` and `pyproject.toml`.
 2. Update `CHANGELOG.md`; keep the comparison links current.

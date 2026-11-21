@@ -7,6 +7,7 @@ interface, because the design does not support multi-user or remote access.
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import logging.handlers
 import os
@@ -108,6 +109,38 @@ def main(argv: list[str] | None = None) -> int:
     port = pick_port(args.port)
 
     app = create_app(paths, settings_store, token, port=port)
+
+    # Closing the console window on Windows does not run the asyncio lifespan
+    # shutdown, so register a synchronous best-effort stop as well. It only
+    # stops an OVMS instance this process started (see ModelManager ownership).
+    def _shutdown_children() -> None:
+        ctx = getattr(app.state, "ctx", None)
+        models = getattr(ctx, "models", None) if ctx is not None else None
+        if models is not None:
+            try:
+                models.shutdown_children()
+            except Exception:
+                pass
+
+    atexit.register(_shutdown_children)
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            def _console_handler(event: int) -> int:
+                # 2=close, 5=logoff, 6=shutdown. Ctrl+C/Break (0/1) must fall
+                # through to the default handler so the server still exits.
+                if event in (2, 5, 6):
+                    _shutdown_children()
+                    return 1
+                return 0
+
+            # The callback must outlive this function: Windows keeps the pointer.
+            callback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint)(_console_handler)
+            if ctypes.windll.kernel32.SetConsoleCtrlHandler(callback, True):
+                globals()["_CONSOLE_SHUTDOWN_HANDLER"] = callback
+        except Exception:
+            pass
 
     if not args.no_browser:
         threading.Thread(target=open_when_ready, args=(port,), daemon=True).start()

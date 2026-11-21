@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -168,6 +168,132 @@ CREATE TABLE IF NOT EXISTS document_sections (
   tokens      INTEGER NOT NULL DEFAULT 0,
   created_at  INTEGER NOT NULL,
   PRIMARY KEY (document_id, level, ordinal)
+);
+
+-- Opt-in document scope per chat. A conversation sees only the documents the
+-- user attached in the chat menu; document memory is never global.
+CREATE TABLE IF NOT EXISTS conversation_documents (
+  conversation_id TEXT NOT NULL,
+  document_id     TEXT NOT NULL,
+  added_at        INTEGER NOT NULL,
+  PRIMARY KEY (conversation_id, document_id)
+);
+CREATE INDEX IF NOT EXISTS ix_convdoc_doc ON conversation_documents(document_id);
+
+CREATE TABLE IF NOT EXISTS document_page_notes (
+  document_id   TEXT NOT NULL,
+  page_no       INTEGER NOT NULL,
+  note          TEXT NOT NULL,
+  prev_summary  TEXT,
+  tokens        INTEGER NOT NULL DEFAULT 0,
+  complete      INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
+  PRIMARY KEY (document_id, page_no)
+);
+
+-- Long-term tree memory. A tree is an ordered set of immutable chunks
+-- (one complete exchange, or one document page) summarised into degree-1
+-- nodes (3 children), degree-2 nodes (3 degree-1 nodes), and so on. Old
+-- nodes are never pruned; a re-summarisation creates a new node and flips
+-- the parent's active child pointer.
+CREATE TABLE IF NOT EXISTS memory_trees (
+  id          TEXT PRIMARY KEY,
+  kind        TEXT NOT NULL DEFAULT 'chat',  -- chat | document
+  title       TEXT NOT NULL,
+  ref_id      TEXT,                          -- document summary id when kind=document
+  root_id     TEXT,
+  node_count  INTEGER NOT NULL DEFAULT 0,
+  leaf_count  INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_tree_kind ON memory_trees(kind, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS tree_nodes (
+  id          TEXT PRIMARY KEY,
+  tree_id     TEXT NOT NULL,
+  parent_id   TEXT,
+  degree      INTEGER NOT NULL DEFAULT 1,
+  ordinal     INTEGER NOT NULL DEFAULT 0,
+  summary     TEXT NOT NULL,
+  unit_keys   TEXT NOT NULL DEFAULT '[]',    -- JSON list of chunk keys or child node ids
+  page_from   INTEGER,
+  page_to     INTEGER,
+  tokens      INTEGER NOT NULL DEFAULT 0,
+  state       TEXT NOT NULL DEFAULT 'complete', -- pending | complete | stale
+  active      INTEGER NOT NULL DEFAULT 1,
+  source_hash TEXT,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_node_tree ON tree_nodes(tree_id, degree, ordinal);
+CREATE INDEX IF NOT EXISTS ix_node_parent ON tree_nodes(parent_id);
+
+CREATE TABLE IF NOT EXISTS tree_chunks (
+  tree_id    TEXT NOT NULL,
+  chunk_key  TEXT NOT NULL,
+  ordinal    INTEGER NOT NULL,
+  payload    TEXT NOT NULL,                  -- JSON: role/content refs or page ref
+  tokens     INTEGER NOT NULL DEFAULT 0,
+  complete   INTEGER NOT NULL DEFAULT 0,
+  parent_id  TEXT,                           -- set when rolled into a degree-1 node
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (tree_id, chunk_key)
+);
+CREATE INDEX IF NOT EXISTS ix_chunk_tree ON tree_chunks(tree_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS tree_embeddings (
+  owner_type TEXT NOT NULL,
+  owner_id   TEXT NOT NULL,
+  model      TEXT NOT NULL,
+  dim        INTEGER NOT NULL,
+  vec        BLOB NOT NULL,
+  norm       REAL NOT NULL,
+  PRIMARY KEY (owner_type, owner_id, model)
+);
+
+-- Usage feedback for tree nodes. Node rows stay immutable; how often a branch
+-- proved useful lives here so retrieval can prefer proven paths without ever
+-- rewriting a summary.
+CREATE TABLE IF NOT EXISTS tree_node_usage (
+  tree_id    TEXT NOT NULL,
+  node_id    TEXT NOT NULL,
+  hits       INTEGER NOT NULL DEFAULT 0,
+  relevance  REAL NOT NULL DEFAULT 0.0,
+  last_used  INTEGER NOT NULL,
+  PRIMARY KEY (tree_id, node_id)
+);
+
+-- Iterative response drafting for tasks that cannot fit in one context window.
+-- Each batch appends one chunk; nothing already written is rewritten.
+CREATE TABLE IF NOT EXISTS response_tasks (
+  id             TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  request_id     TEXT,
+  title          TEXT NOT NULL,
+  instruction    TEXT NOT NULL,
+  topics         TEXT NOT NULL DEFAULT '[]',
+  document_ids   TEXT NOT NULL DEFAULT '[]',
+  units          TEXT NOT NULL DEFAULT '[]',
+  model          TEXT,
+  cursor         INTEGER NOT NULL DEFAULT 0,
+  total_units    INTEGER NOT NULL DEFAULT 0,
+  state          TEXT NOT NULL DEFAULT 'queued',
+  error          TEXT,
+  summary_id     TEXT,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_task_conv ON response_tasks(conversation_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS response_task_chunks (
+  task_id    TEXT NOT NULL,
+  ordinal    INTEGER NOT NULL,
+  unit_from  INTEGER NOT NULL,
+  unit_to    INTEGER NOT NULL,
+  content    TEXT NOT NULL,
+  tokens     INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (task_id, ordinal)
 );
 
 CREATE TABLE IF NOT EXISTS retrieval_log (

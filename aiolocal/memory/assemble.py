@@ -96,7 +96,8 @@ def _render_system(
 
     if items:
         has_document = any(
-            str(i.summary_kind).startswith("document") for i in items
+            str(i.summary_kind).startswith("document") or i.summary_kind == "tree_page"
+            for i in items
         )
         if has_document:
             parts.append(
@@ -108,7 +109,11 @@ def _render_system(
             )
         parts.append("\n\n## What you remember (retrieved)\n")
         for item in items:
-            if item.kind == "summary":
+            if item.summary_kind == "tree_page":
+                parts.append(f"### Document excerpt — {item.title}\n{item.body}\n")
+            elif item.summary_kind == "tree_chunk":
+                parts.append(f"### Exact exchange\n{item.body}\n")
+            elif item.kind == "summary":
                 tag = f"  [{item.topic}]" if item.topic else ""
                 parts.append(f"### Summary — {item.title}{tag}\n{item.body}\n")
             elif item.kind in ("document_page", "document_section"):
@@ -251,13 +256,12 @@ def assemble(
 
     summaries = [i for i in items if i.kind == "summary"]
     exact = [i for i in items if i.kind == "exact"]
-    documents = [
-        i for i in items
-        if str(i.summary_kind).startswith("document")
-    ]
-    other_summaries = [
-        i for i in summaries if not str(i.summary_kind).startswith("document")
-    ]
+
+    def _is_document(item: MemoryItem) -> bool:
+        return str(item.summary_kind).startswith("document") or item.summary_kind == "tree_page"
+
+    documents = [i for i in items if _is_document(i)]
+    other_summaries = [i for i in summaries if not _is_document(i)]
 
     # Document summaries are the complete analysis of a PDF the user attached.
     # They are large and must not be crowded out by incidental exact excerpts, so

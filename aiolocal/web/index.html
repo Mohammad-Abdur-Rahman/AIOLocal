@@ -106,8 +106,29 @@
               <span id="chat-doc-status" class="muted small">Waiting…</span>
               <div class="progress"><i id="chat-doc-bar" style="width:4%"></i></div>
             </div>
+            <button type="button" id="chat-doc-pause" class="btn ghost small hidden">Pause</button>
+            <button type="button" id="chat-doc-resume" class="btn ghost small hidden">Resume</button>
             <button type="button" id="chat-doc-cancel" class="btn ghost small hidden">Cancel</button>
             <button type="button" id="chat-doc-hide" class="btn ghost small hidden">Hide</button>
+          </div>
+          <div id="chat-doc-scope" class="attachment hidden">
+            <div class="attachment-meta grow">
+              <strong>Document memory for this chat</strong>
+              <span class="muted small">Only ticked documents may supply context. Nothing is global.</span>
+              <div id="chat-doc-scope-list" class="scope-list"></div>
+            </div>
+            <button type="button" id="chat-doc-scope-close" class="btn ghost small">Close</button>
+          </div>
+          <div id="chat-task" class="attachment hidden">
+            <div class="attachment-meta grow">
+              <strong id="chat-task-name">Long task</strong>
+              <span id="chat-task-status" class="muted small">Starting…</span>
+              <div class="progress"><i id="chat-task-bar" style="width:0%"></i></div>
+            </div>
+            <button type="button" id="chat-task-pause" class="btn ghost small hidden">Pause</button>
+            <button type="button" id="chat-task-resume" class="btn ghost small hidden">Resume</button>
+            <button type="button" id="chat-task-cancel" class="btn ghost small hidden">Cancel</button>
+            <button type="button" id="chat-task-open" class="btn ghost small hidden">Open draft</button>
           </div>
           <textarea id="prompt" rows="3" placeholder="Message your local model…" autocomplete="off"></textarea>
           <input id="chat-image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" class="hidden">
@@ -115,6 +136,7 @@
           <div class="composer-row">
             <button type="button" id="chat-attach" class="btn ghost small" title="Attach an image for a vision model">Attach image</button>
             <button type="button" id="chat-add-document" class="btn ghost small" title="Read every PDF page with the main vision model and save the result to memory">Add document</button>
+            <button type="button" id="chat-doc-scope-toggle" class="btn ghost small" title="Choose which analysed documents this chat may use">Document memory</button>
             <select id="chat-knowledge" class="compact-select" aria-label="Knowledge collection for this message" title="Reference the knowledge base for this message only">
               <option value="">Knowledge: off</option>
               <option value="auto">Auto (route by folder)</option>
@@ -194,6 +216,15 @@
           </div>
           <div id="summary-list" class="summary-list"></div>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="section-head tight">
+          <h2>Memory tree</h2>
+          <select id="tree-select" class="compact-select"><option value="">All trees</option></select>
+        </div>
+        <p class="muted small">This is the exact structure retrieval walks: chunks roll up 3-at-a-time, and a query back-traces through the summaries to the source chunks. Nothing is pruned.</p>
+        <div id="tree-detail" class="tree-detail"></div>
       </div>
 
       <div class="card">

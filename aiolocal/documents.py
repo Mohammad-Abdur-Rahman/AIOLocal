@@ -37,6 +37,7 @@ from .db import Database, now_ms
 from .llm import api_url
 from .memory import store
 from .memory import semantic
+from .memory import tree, treebuild
 from .memory.text import embed, estimate_tokens, new_id
 from .models import CATALOG, load_custom_models
 
@@ -44,41 +45,37 @@ VISION_SYSTEM = (
     "You are the document indexing engine of a local AI workspace. You read PDF "
     "page images carefully and write durable memory notes. Never invent content: "
     "when a page is unclear, say so. Preserve exact names, numbers, dates, units, "
-    "definitions, equations and code."
+    "definitions, equations and code.\n\n"
+    "Describe only what is visible on the page. Do not solve, answer, simplify or "
+    "evaluate any problem, exercise, question or equation. For any problem or "
+    "equation, transcribe it exactly as printed, including its number and every "
+    "shown step; never add steps that are not printed. Describe layout and "
+    "positioning precisely: where each block sits (top, bottom, left, right, "
+    "centre), what diagrams contain (axes, labels, arrows, relative positions), "
+    "table row/column order, and the overall visual structure. If a region is "
+    "cut off, blurry or unreadable, say which region and do not guess."
 )
 
 BATCH_PROMPT = """Index page(s) {first}-{last} of "{title}" for long-term memory.
 
-For EACH page, write a section exactly like "Page N" and cover:
+For EACH page, write a section exactly like "Page N" and cover only what is visible:
 - the subject and purpose of the page;
-- key facts, names, dates, numbers, definitions and conclusions;
-- diagrams, charts and tables: describe axes, labels, values and relationships;
-- equations or code: transcribe them exactly;
+- key facts, names, dates, numbers, definitions and conclusions as printed;
+- diagrams, charts and tables: describe axes, labels, values, positions and relationships;
+- equations or code: transcribe them exactly; do not solve or complete them;
 - anything a reader would need to find this page again (terms, titles, headings).
 
-Finish the whole answer with a "Memory-worthy points" bullet list of the five
-most important takeaways across these pages. Be concise but complete. If a page
-is blank or illegible, say so instead of guessing."""
+Finish the whole answer with a "Visible points" bullet list of the five most
+important things actually shown across these pages. Do not infer beyond the
+page. If a page is blank or illegible, say so instead of guessing."""
 
-FINAL_PROMPT = """Consolidate the notes below into ONE overview of "{title}" ({pages} pages).
+PARTIAL_PROMPT = """This document analysis was interrupted after {done} of {total} pages.
 
-Write 250-700 words in these sections:
-1. Overview - what the document is and what it covers.
-2. Key facts - the most important details, numbers, names and definitions.
-3. Structure - the main parts and what each contains.
-4. Practical details - equations, code, tables, instructions or warnings.
-5. Retrieval keywords - 8-15 terms a person would use to find this document.
-
-Do not invent anything that is not in the notes. If the notes are partial, say
-which parts are missing. Return plain Markdown only.
+Summarise only the notes below. Do not invent or infer content for the missing
+pages. Start with the line "Partial analysis: {done} of {total} pages." and list
+which page ranges are missing.
 
 NOTES:
-{notes}"""
-
-REDUCE_PROMPT = """Summarise these sections of "{title}" in 150-250 words.
-Keep names, numbers, definitions and conclusions. Do not invent anything.
-
-SECTIONS:
 {notes}"""
 
 SECTION_PAGES = 8
@@ -105,6 +102,7 @@ class DocumentJob:
     created_at: int = field(default_factory=now_ms)
     updated_at: int = field(default_factory=now_ms)
     cancel: threading.Event = field(default_factory=threading.Event, repr=False)
+    pause: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def public(self) -> dict:
         return {
@@ -140,6 +138,7 @@ class DocumentAnalyzer:
         *,
         publish: Callable[[str, dict], None] | None = None,
         models=None,
+        trees=None,
     ) -> None:
         self.paths = paths
         self.settings_store = settings_store
@@ -148,6 +147,9 @@ class DocumentAnalyzer:
         # Optional ModelManager, used to avoid calling a model whose folder was
         # deleted or that is not active in OVMS (which returns a MediaPipe 404).
         self.models = models
+        # TreeBuilder: page notes are also written into an append-only document
+        # tree so summaries roll up and queries can back-trace to one page.
+        self.trees = trees
         self.dir = paths.data_dir / "documents"
         self.dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -188,6 +190,39 @@ class DocumentAnalyzer:
             if not job:
                 return False
             job.cancel.set()
+            job.pause.clear()
+            return True
+
+    def pause(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.state not in ("queued", "running"):
+                return False
+            job.pause.set()
+            if job.state == "queued":
+                job.state = "paused"
+                job.updated_at = now_ms()
+                self._save_job(job)
+            self._emit(job)
+            return True
+
+    def resume(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.state != "paused":
+                return False
+            job.pause.clear()
+            job.state = "running"
+            job.updated_at = now_ms()
+            self._save_job(job)
+            self._emit(job)
+            thread = self._threads.get(job.id)
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(
+                    target=self._run, args=(job,), name=f"doc-{job.id}", daemon=True
+                )
+                self._threads[job.id] = thread
+                thread.start()
             return True
 
     def _restore(self) -> None:
@@ -217,6 +252,10 @@ class DocumentAnalyzer:
             )
             with self._lock:
                 self._jobs[job.id] = job
+            if job.state == "paused":
+                # A job the user paused before closing stays paused after a
+                # restart; it is resumed explicitly from the UI.
+                continue
             if job.state in ("queued", "running", "interrupted"):
                 if Path(job.path).is_file():
                     resumable.append(job)
@@ -335,18 +374,12 @@ class DocumentAnalyzer:
         self._save_job(job)
         self._emit(job)
 
-        header = (
-            f"# Document: {job.title}\n"
-            f"Source: {job.filename} ({job.pages_total} pages). "
-            "Analysed page by page with the local vision model.\n\n"
-            "## Overview\n_Analysis in progress._\n"
-        )
         try:
             if not job.summary_id:
                 job.summary_id = store.insert_summary(
                     self.db,
                     title=f"Document: {job.title}"[:200],
-                    body=header,
+                    body=self._status_body(job, None),
                     topic_slug="documents",
                     kind="document",
                     salience=0.72,
@@ -356,20 +389,17 @@ class DocumentAnalyzer:
                     embed_dim=settings.embed_dim,
                 )
                 self._save_job(job)
-            else:
+            elif self._pages_done(job.summary_id) == 0:
+                # Only reset the body when nothing has been analysed yet. A
+                # resume must never overwrite a partial summary with a fresh
+                # "Analysis in progress" placeholder.
                 store.update_summary_body(
-                    self.db, job.summary_id, header, title=f"Document: {job.title}",
-                    embed_dim=settings.embed_dim,
+                    self.db, job.summary_id, self._status_body(job, None),
+                    title=f"Document: {job.title}", embed_dim=settings.embed_dim,
                 )
         except Exception as exc:
             self._fail(job, f"could not create the memory entry ({type(exc).__name__}: {exc})")
             return
-        try:
-            semantic.index_summary(
-                self.db, settings, job.summary_id, f"Document: {job.title}", header
-            )
-        except Exception:
-            pass
 
         completed = self._pages_done(job.summary_id)
         job.pages_done = completed
@@ -380,6 +410,17 @@ class DocumentAnalyzer:
             for start in range(completed + 1, job.pages_total + 1, step):
                 if job.cancel.is_set():
                     break
+                if job.pause.is_set():
+                    job.state = "paused"
+                    self._save_job(job)
+                    self._emit(job)
+                    while job.pause.is_set() and not job.cancel.is_set():
+                        job.pause.wait(timeout=0.25)
+                    if job.cancel.is_set():
+                        break
+                    job.state = "running"
+                    self._save_job(job)
+                    self._emit(job)
                 end = min(job.pages_total, start + step - 1)
                 images = self._render_pages(job.path, start, end, settings.document_dpi)
                 if not images:
@@ -394,14 +435,17 @@ class DocumentAnalyzer:
                 self._save_job(job)
                 self._emit(job)
 
-            if job.cancel.is_set():
-                job.state = "interrupted" if self._closing else "cancelled"
+            if job.cancel.is_set() or job.pause.is_set():
+                job.state = "interrupted" if self._closing else (
+                    "paused" if job.pause.is_set() else "cancelled"
+                )
+                self._write_partial(job, settings, final=False)
                 self._save_job(job)
                 self._emit(job)
                 return
 
             self._build_sections(job, settings)
-            final = self._compose_overview(job, settings)
+            final = self._compose_overview(job, settings, partial=False)
             job.final = final
             body = self._compose_body(job, final)
             store.update_summary_body(
@@ -424,15 +468,7 @@ class DocumentAnalyzer:
             try:
                 if job.summary_id and pages:
                     self._build_sections(job, settings)
-                    final = self._compose_overview(job, settings)
-                    body = self._compose_body(job, final)
-                    store.update_summary_body(
-                        self.db, job.summary_id, body,
-                        title=f"Document: {job.title}", embed_dim=settings.embed_dim,
-                    )
-                    semantic.index_summary(
-                        self.db, settings, job.summary_id, f"Document: {job.title}", body
-                    )
+                    self._write_partial(job, settings, final=False)
                 elif job.summary_id:
                     store.delete_summary(self.db, job.summary_id)
                     job.summary_id = ""
@@ -452,20 +488,124 @@ class DocumentAnalyzer:
 
     # ------------------------------------------------------------------ pages
     def _pages_done(self, document_id: str) -> int:
+        """Number of contiguous pages stored from page 1 upward.
+
+        Using MAX(page_no) would silently skip a gap if a write was interrupted
+        between pages. Counting the contiguous prefix makes resume re-process
+        the first missing page instead of skipping it.
+        """
         if not document_id:
             return 0
         with self.db.read() as c:
-            row = c.execute(
-                "SELECT COALESCE(MAX(page_no),0) FROM document_pages WHERE document_id=?",
+            rows = c.execute(
+                "SELECT page_no FROM document_pages WHERE document_id=? ORDER BY page_no",
                 (document_id,),
-            ).fetchone()
-        return int(row[0]) if row else 0
+            ).fetchall()
+        done = 0
+        for row in rows:
+            if int(row["page_no"]) != done + 1:
+                break
+            done += 1
+        return done
+
+    def _status_body(self, job: DocumentJob, final: str | None) -> str:
+        """Honest summary body: never claims more than the pages actually stored."""
+        done = max(0, int(job.pages_done or 0))
+        total = max(0, int(job.pages_total or 0))
+        state = job.state or "queued"
+        if final:
+            overview = final
+        elif done == 0:
+            overview = "_Analysis in progress. No pages have been stored yet._"
+        elif total and done < total:
+            overview = (
+                f"_Partial analysis: {done} of {total} pages. "
+                f"Pages {done + 1}-{total} have not been analysed yet._"
+            )
+        else:
+            overview = f"_{done} pages analysed._"
+        return (
+            f"# Document: {job.title}\n"
+            f"Source: {job.filename} ({total or '?'} pages). "
+            f"Analysed page by page with the local vision model.\n\n"
+            f"## Status\n{state}; {done} of {total or '?'} pages stored.\n\n"
+            f"## Overview\n{overview}\n"
+        )
+
+    def _write_partial(self, job: DocumentJob, settings: Settings, *, final: bool) -> None:
+        """Persist an honest partial body after cancel/pause/error.
+
+        This never calls the full-document consolidation prompt. It summarises
+        only the completed pages and states the page ranges that are missing,
+        so a cancelled job cannot present invented content.
+        """
+        if not job.summary_id:
+            return
+        pages = self._pages_done(job.summary_id)
+        if pages <= 0:
+            return
+        body = self._compose_partial(job, settings, pages)
+        store.update_summary_body(
+            self.db, job.summary_id, body,
+            title=f"Document: {job.title}", embed_dim=settings.embed_dim,
+        )
+        try:
+            semantic.index_summary(
+                self.db, settings, job.summary_id, f"Document: {job.title}", body
+            )
+        except Exception:
+            pass
+
+    def _compose_partial(self, job: DocumentJob, settings: Settings, pages: int) -> str:
+        notes: list[tuple[int, int, str]] = []
+        with self.db.read() as c:
+            rows = c.execute(
+                """SELECT level, ordinal, page_from, page_to, summary
+                   FROM document_sections WHERE document_id=? AND level=1
+                   ORDER BY ordinal""",
+                (job.summary_id,),
+            ).fetchall()
+        notes = [(int(r["page_from"]), int(r["page_to"]), r["summary"]) for r in rows]
+        if not notes:
+            with self.db.read() as c:
+                rows = c.execute(
+                    "SELECT page_no, text FROM document_pages WHERE document_id=? "
+                    "ORDER BY page_no LIMIT 40",
+                    (job.summary_id,),
+                ).fetchall()
+            notes = [(int(r["page_no"]), int(r["page_no"]), r["text"]) for r in rows]
+        text = "\n\n".join(f"### Pages {a}-{b}\n{t}" for a, b, t in notes)[:12_000]
+        prompt = PARTIAL_PROMPT.format(
+            done=pages, total=max(job.pages_total, pages), notes=text
+        )
+        out = self._ask_text(settings, job.model, prompt, max_tokens=900)
+        header = (
+            f"# Document: {job.title}\n"
+            f"Source: {job.filename} ({job.pages_total} pages). "
+            f"Partial analysis: {pages} of {job.pages_total} pages; state {job.state}.\n\n"
+            "## Overview\n"
+        )
+        if out:
+            return header + out + "\n"
+        missing = (
+            f"\n\n_Missing pages: {pages + 1}-{job.pages_total}._"
+            if job.pages_total > pages
+            else ""
+        )
+        return header + text[:4000] + missing + "\n"
 
     def _store_pages(
         self, job: DocumentJob, first: int, last: int, text: str, embed_dim: int
     ) -> None:
         pieces = _split_page_text(text, first, last)
         with self.db.write() as c:
+            prev_summary = ""
+            row = c.execute(
+                "SELECT note FROM document_page_notes WHERE document_id=? AND page_no=?",
+                (job.summary_id, first - 1),
+            ).fetchone()
+            if row:
+                prev_summary = str(row["note"] or "")
             for page_no in range(first, last + 1):
                 page_text = pieces.get(page_no, "").strip()
                 if not page_text:
@@ -477,6 +617,23 @@ class DocumentAnalyzer:
                            text=excluded.text, tokens=excluded.tokens, created_at=excluded.created_at""",
                     (job.summary_id, page_no, page_text, estimate_tokens(page_text), now_ms()),
                 )
+                # Append-only rolling note: page N carries page N-1's note so a
+                # later summary does not need to re-read pages 1..N-1.
+                c.execute(
+                    """INSERT INTO document_page_notes(document_id, page_no, note, prev_summary,
+                           tokens, complete, created_at)
+                       VALUES(?,?,?,?,?,?,?)
+                       ON CONFLICT(document_id, page_no) DO UPDATE SET
+                           note=excluded.note, prev_summary=excluded.prev_summary,
+                           tokens=excluded.tokens, complete=excluded.complete,
+                           created_at=excluded.created_at""",
+                    (
+                        job.summary_id, page_no, page_text[:2000],
+                        prev_summary[:800] if prev_summary else None,
+                        estimate_tokens(page_text), 1, now_ms(),
+                    ),
+                )
+                prev_summary = page_text
         for page_no in range(first, last + 1):
             page_text = pieces.get(page_no, "").strip()
             if not page_text:
@@ -488,6 +645,29 @@ class DocumentAnalyzer:
                     f"{job.summary_id}:{page_no}",
                     "hash",
                     embed(page_text[:2000], embed_dim),
+                )
+            except Exception:
+                pass
+            if self.trees is not None:
+                try:
+                    treebuild.append_document_page(
+                        self.db,
+                        document_id=job.summary_id,
+                        page_no=page_no,
+                        text=page_text,
+                        title=job.title,
+                    )
+                except Exception:
+                    pass
+        if self.trees is not None:
+            try:
+                self.trees.kick(
+                    tree.get_or_create_tree(
+                        self.db,
+                        kind="document",
+                        ref_id=job.summary_id,
+                        title=job.title,
+                    )
                 )
             except Exception:
                 pass
@@ -553,65 +733,61 @@ class DocumentAnalyzer:
         self._save_job(job)
 
     # ------------------------------------------------------------------ summaries
-    def _compose_overview(self, job: DocumentJob, settings: Settings) -> str:
+    def _compose_overview(
+        self, job: DocumentJob, settings: Settings, *, partial: bool = False
+    ) -> str:
+        """Overview built from completed children only, never a fresh rewrite.
+
+        The previous implementation asked the model to consolidate the *whole*
+        document in one prompt on every run. That single lossy pass was the
+        hallucination source. Now the overview is the tree's active roots: each
+        group of three completed children was summarised once, at the moment it
+        completed, and nothing is ever re-derived from a summary of a summary of
+        the whole document.
+        """
+        if partial:
+            return self._compose_partial(job, settings, self._pages_done(job.summary_id))
+        covered: set[int] = set()
+        parts: list[str] = []
+        if self.trees is not None and job.summary_id:
+            try:
+                doc_tree = tree.tree_by_ref(
+                    self.db, kind="document", ref_id=job.summary_id
+                )
+                if doc_tree:
+                    detail = tree.outline(self.db, str(doc_tree["id"]))
+                    roots = [
+                        node for node in detail.get("nodes", [])
+                        if not node.get("parent") and node.get("summary")
+                    ]
+                    roots.sort(
+                        key=lambda n: (int(n.get("degree") or 0), int(n.get("ordinal") or 0))
+                    )
+                    for node in roots:
+                        parts.append(str(node["summary"]))
+                        low, high = node.get("page_from"), node.get("page_to")
+                        if low is not None and high is not None:
+                            covered.update(range(int(low), int(high) + 1))
+            except Exception:
+                parts = []
+        # Pages not yet rolled into a node are appended verbatim, so every
+        # completed page appears exactly once and nothing is invented.
         with self.db.read() as c:
             rows = c.execute(
-                """SELECT level, ordinal, page_from, page_to, summary
-                   FROM document_sections WHERE document_id=?
-                   ORDER BY level DESC, ordinal""",
+                """SELECT page_no, note FROM document_page_notes
+                   WHERE document_id=? ORDER BY page_no""",
                 (job.summary_id,),
             ).fetchall()
-        if not rows:
-            return "_No page text was produced._"
-        top_level = int(rows[0]["level"])
-        notes = [
-            (int(r["page_from"]), int(r["page_to"]), r["summary"])
-            for r in rows
-            if int(r["level"]) == top_level
-        ]
-        joined = "\n\n".join(f"### Pages {a}-{b}\n{t}" for a, b, t in notes)
-        if len(joined) > 14_000:
-            grouped: list[tuple[int, int, str]] = []
-            buffer: list[tuple[int, int, str]] = []
-            size = 0
-            for note in notes:
-                cost = len(note[2]) + 40
-                if buffer and size + cost > 10_000:
-                    grouped.append((buffer[0][0], buffer[-1][1], self._reduce_notes(job, settings, buffer)))
-                    buffer, size = [], 0
-                buffer.append(note)
-                size += cost
-            if buffer:
-                grouped.append((buffer[0][0], buffer[-1][1], self._reduce_notes(job, settings, buffer)))
-            notes = grouped
-            joined = "\n\n".join(f"### Pages {a}-{b}\n{t}" for a, b, t in notes)
-        return self._consolidate(job, settings, notes) or (
-            "_The consolidating model was unavailable; section summaries are stored separately._"
-        )
-
-    def _reduce_notes(self, job: DocumentJob, settings: Settings, notes: list[tuple[int, int, str]]) -> str:
-        text = "\n\n".join(t for _, _, t in notes)
-        prompt = REDUCE_PROMPT.format(title=job.title, notes=text[:12_000])
-        out = self._ask_text(settings, job.model, prompt, max_tokens=600)
-        if out:
-            return out
-        return text[:1600]
-
-    def _consolidate(
-        self, job: DocumentJob, settings: Settings, notes: list[tuple[int, int, str]]
-    ) -> str:
-        notes_text = "\n\n".join(f"### Pages {a}-{b}\n{text}" for a, b, text in notes)
-        prompt = FINAL_PROMPT.format(title=job.title, pages=job.pages_total, notes=notes_text[:14_000])
-        out = self._ask_text(settings, job.model, prompt, max_tokens=1400)
-        if out:
-            return out
-        overview = notes[0][2][:1200] if notes else ""
-        return (
-            f"## Overview\n{overview}\n\n"
-            f"## Key facts\nSee the section summaries. The consolidating model was unavailable, "
-            f"so this document's memory contains {len(notes)} indexed sections covering "
-            f"{job.pages_total} pages."
-        )
+        loose = [r for r in rows if int(r["page_no"]) not in covered]
+        if loose:
+            parts.append(
+                "\n\n".join(
+                    f"**Page {int(r['page_no'])}.** {r['note']}" for r in loose
+                )
+            )
+        if parts:
+            return "\n\n".join(part for part in parts if part.strip())
+        return "_No page text was produced._"
 
     def _ask_text(self, settings: Settings, model: str, prompt: str, *, max_tokens: int) -> str:
         payload = {

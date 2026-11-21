@@ -53,7 +53,6 @@ def test_pdf_is_analysed_one_page_per_call(tmp_path: Path):
         return f"Page {first}: notes for page {first}."
 
     analyzer._vision_batch = vision
-    analyzer._consolidate = lambda job, settings, notes: "CONSOLIDATED MEMORY"
 
     job = analyzer.start(pdf, "lesson.pdf")
     current = wait_for(analyzer, job["id"])
@@ -64,7 +63,10 @@ def test_pdf_is_analysed_one_page_per_call(tmp_path: Path):
     assert current["batches_total"] == 5
     assert current["batches_done"] == 5
     assert calls == [(1, 1, 1), (2, 2, 1), (3, 3, 1), (4, 4, 1), (5, 5, 1)]
-    assert current["final"] == "CONSOLIDATED MEMORY"
+    # The overview is a roll-up of completed notes, so every analysed page is
+    # represented and no whole-document re-summarisation call is made.
+    assert "Page 1" in current["final"]
+    assert "Page 5" in current["final"]
     deadline = time.time() + 5
     while pdf.exists() and time.time() < deadline:
         time.sleep(0.02)
@@ -73,7 +75,8 @@ def test_pdf_is_analysed_one_page_per_call(tmp_path: Path):
     summary = store.get_summary(db, current["summary_id"])
     assert summary is not None
     assert summary["kind"] == "document"
-    assert "CONSOLIDATED MEMORY" in summary["body"]
+    assert "Page 1" in summary["body"]
+    assert "Page 5" in summary["body"]
     assert "## Page map" in summary["body"]
     assert "### Pages 1-3" not in summary["body"]
     with db.read() as c:
@@ -145,7 +148,6 @@ def test_resume_continues_after_the_last_stored_page(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(DocumentAnalyzer, "_render_pages", lambda self, path, first, last, dpi: [b"page"])
     monkeypatch.setattr(DocumentAnalyzer, "_vision_batch", vision)
-    monkeypatch.setattr(DocumentAnalyzer, "_consolidate", lambda self, job, settings, notes: "RESUMED")
 
     analyzer = DocumentAnalyzer(paths, settings_store, db)
     current = wait_for(analyzer, "job-resume")
@@ -178,7 +180,6 @@ def test_cancel_stops_before_the_final_consolidation(tmp_path: Path):
         return "partial"
 
     analyzer._vision_batch = vision
-    analyzer._consolidate = lambda job, settings, notes: "SHOULD NOT RUN"
 
     job = analyzer.start(pdf, "cancel.pdf")
     holder.append(job["id"])
@@ -189,7 +190,6 @@ def test_cancel_stops_before_the_final_consolidation(tmp_path: Path):
     assert current["final"] == ""
     summary = store.get_summary(db, current["summary_id"])
     assert summary is not None
-    assert "SHOULD NOT RUN" not in summary["body"]
     # The source is kept so the job can be resumed later.
     assert pdf.exists()
 

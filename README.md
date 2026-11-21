@@ -3,14 +3,40 @@
 **A local, memory-first AI workspace for Intel laptops.** Chat, image generation, model
 management, and a transparent long-term memory system — all on `127.0.0.1`, with no cloud calls.
 
-This is **v0.2.1**, a bug-fix release on top of the first public release. It is a real,
+This is **v0.3.0**, a memory redesign on top of the first public release. It is a real,
 working product: chat, memory, a knowledge/reference library, local image generation, a GIMP
 dock, and a source-build path for Linux. What exists is listed below; what does not exist is
 listed just as plainly.
 
 ---
 
-## What's fixed in 0.2.1
+## What's new in 0.3.0
+
+- **Memory is an append-only tree, not a top-k list.** Every three complete units roll up into
+  one summary, forever: chunks become degree-1 notes, three of those become degree-2, and so
+  on. Nothing is pruned or rewritten, and retrieval walks several branches down to the exact
+  source unit, so an answer can show where it came from.
+- **Chat memory and document memory are separate trees.** A query can use the conversation
+  tree and any opted-in document trees without one crowding out the other.
+- **Documents are ordered pages.** Each page keeps its own verbatim text and an incremental
+  note that appends the previous note as context. The overview is a roll-up of tree roots plus
+  every page note that is not yet covered, so no page disappears from the summary and the
+  whole document is never re-summarised in one call (the main source of invented content).
+- **Document memory is opt-in per chat.** The chat menu chooses which documents the model may
+  read; the Memory view shows the same scope. "page 12" and "pages 3-5" resolve exact text,
+  including several ranges in one request.
+- **Exhaustive document jobs run in the background.** A long task such as categorising every
+  question in a 584-page file appends draft sections, keeps only the unfinished segment in
+  context, survives pause/failure/restart from a persisted cursor, and makes the finished
+  draft presentable at the end.
+- **Analysis jobs can be paused** as well as cancelled, and resume from the last completed
+  page.
+- **Closing the app stops its OVMS process.** Only the OVMS the app started is stopped; an
+  external server you started yourself is left running.
+- **Existing data is backfilled once at startup.** Old conversations and documents enter
+  their trees in the background, without blocking the UI.
+
+## What was fixed in 0.2.1
 
 - **Deleting a memory now removes everything derived from it.** Summaries, topic links, raw
   messages, FTS rows, vectors and now-empty topics are deleted in one cascade, so a deleted
@@ -53,15 +79,17 @@ listed just as plainly.
 
 ---
 
-## What works in v0.2
+## What works in v0.3
 
 | Area | Status |
 |---|---|
 | Local server + browser UI | ✅ |
 | Chat with streaming through any OpenAI-compatible upstream (OVMS by default) | ✅ |
 | Exact memory DB (append-only, deduplicated, SQLite WAL) | ✅ |
+| Append-only memory tree (chunks → degree-1 → degree-2 …), beam back-trace to exact units | ✅ |
+| Separate chat and document trees, browsable in the Memory view with provenance | ✅ |
 | Summary memory + topics + many-to-many links | ✅ |
-| Hybrid retrieval (BM25 + local hashed embeddings + reciprocal rank fusion) | ✅ |
+| Hybrid retrieval (BM25 + local hashed embeddings + reciprocal rank fusion) as a fallback | ✅ |
 | Optional OVMS semantic embeddings fused with hash retrieval, with re-embed job | ✅ |
 | Optional LLM filing with deterministic heuristic fallback | ✅ |
 | Token-budgeted prompt assembly with the documented trim order | ✅ |
@@ -70,7 +98,9 @@ listed just as plainly.
 | Custom OpenVINO IR import (Hugging Face URL or local folder) with role-based auto-configuration | ✅ |
 | Image generation/edit proxy + local gallery | ✅ |
 | Image attachments to a vision chat model (Qwen3-VL 4B) | ✅ |
-| PDF chat attachments: every page rendered and analysed one page per vision call, grouped into section memory and resumable jobs | ✅ |
+| PDF chat attachments: every page rendered and analysed one page per vision call, stored as ordered pages with incremental notes | ✅ |
+| Per-chat document opt-in and direct page queries ("page 12", "pages 3-5") | ✅ |
+| Resumable background tasks for exhaustive document work (pause, resume, append-only draft) | ✅ |
 | Offline math rendering (bundled KaTeX) and PDF text extraction (pypdf) | ✅ |
 | Local-only security: loopback bind, per-install token, origin/host checks, CSP | ✅ |
 | Windows build (PyInstaller onedir) and Linux source build | ✅ |

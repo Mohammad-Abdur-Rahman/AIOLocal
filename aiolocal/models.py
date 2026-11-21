@@ -641,6 +641,8 @@ class ModelManager:
         self._ovms_port = 8000
         self._ovms_generation = 0
         self._watch_thread: threading.Thread | None = None
+        self._pid_path = paths.data_dir / "ovms.pid"
+        self._job_object = None
         self._state = self._load_state()
 
     # ------------------------------------------------------------------ state
@@ -1832,6 +1834,7 @@ class ModelManager:
                 pass
             self._log_handle = None
             raise
+        self._claim_ovms_process(self._process, port)
         self._ovms_port = port
         self._ovms_started_at = time.time()
         self._ovms_ready_at = 0.0
@@ -1855,18 +1858,116 @@ class ModelManager:
             "warnings": config_errors,
         }
 
+    def _claim_ovms_process(self, proc: subprocess.Popen, port: int) -> None:
+        """Record ownership so shutdown can stop only the OVMS this app started.
+
+        On Windows the child is also put in a job object with
+        ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``. When this process dies for any
+        reason (including a console window closed with the X button, where the
+        asyncio lifespan shutdown never runs), Windows kills the whole job.
+        An OVMS instance this app did not start is never touched.
+        """
+        try:
+            self._pid_path.write_text(
+                json.dumps({"pid": int(proc.pid), "port": int(port)}),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                kernel32 = ctypes.windll.kernel32
+                job = kernel32.CreateJobObjectW(None, None)
+                if job:
+                    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                        _fields_ = [
+                            ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+                            ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+                            ("LimitFlags", wintypes.DWORD),
+                            ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t),
+                            ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t),
+                            ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD),
+                        ]
+
+                    class _IO_COUNTERS(ctypes.Structure):
+                        _fields_ = [
+                            ("ReadOperationCount", ctypes.c_ulonglong),
+                            ("WriteOperationCount", ctypes.c_ulonglong),
+                            ("OtherOperationCount", ctypes.c_ulonglong),
+                            ("ReadTransferCount", ctypes.c_ulonglong),
+                            ("WriteTransferCount", ctypes.c_ulonglong),
+                            ("OtherTransferCount", ctypes.c_ulonglong),
+                        ]
+
+                    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                        _fields_ = [
+                            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                            ("IoInfo", _IO_COUNTERS),
+                            ("ProcessMemoryLimit", ctypes.c_size_t),
+                            ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                            ("PeakJobMemoryUsed", ctypes.c_size_t),
+                        ]
+
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+                    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                    if kernel32.SetInformationJobObject(
+                        job, 9, ctypes.byref(info), ctypes.sizeof(info)
+                    ):
+                        # Keep this handle for the lifetime of the child. Closing
+                        # it (including when this process exits) kills the job.
+                        if kernel32.AssignProcessToJobObject(job, int(proc._handle)):
+                            self._job_object = job
+                        else:
+                            kernel32.CloseHandle(job)
+                    else:
+                        kernel32.CloseHandle(job)
+            except Exception:
+                self._job_object = None
+
+    def _release_ovms_claim(self) -> None:
+        job = self._job_object
+        self._job_object = None
+        if job:
+            try:
+                import ctypes
+
+                ctypes.windll.kernel32.CloseHandle(job)
+            except Exception:
+                pass
+        try:
+            self._pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def stop_ovms(self) -> dict:
         self._ovms_generation += 1
         proc = self._process
         if not proc or proc.poll() is not None:
+            self._release_ovms_claim()
             self._set_ovms_state("stopped", "Stopped")
             return {"ok": True, "already_stopped": True}
-        proc.terminate()
         try:
-            proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
         finally:
+            # Closing the job handle is the last resort: on Windows it kills any
+            # OVMS child still attached to it.
+            self._release_ovms_claim()
             if self._log_handle:
                 try:
                     self._log_handle.close()
@@ -1875,3 +1976,15 @@ class ModelManager:
                 self._log_handle = None
         self._set_ovms_state("stopped", "Stopped")
         return {"ok": True, "stopped": True}
+
+    def shutdown_children(self) -> None:
+        """Best-effort synchronous stop for console-close / atexit paths.
+
+        The lifespan ``finally`` block calls ``stop_ovms`` on a graceful
+        shutdown. Windows console-close events do not run asyncio shutdown, so
+        this is also registered with ``atexit`` and a console control handler.
+        """
+        try:
+            self.stop_ovms()
+        except Exception:
+            pass

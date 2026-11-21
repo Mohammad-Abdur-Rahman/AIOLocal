@@ -23,7 +23,7 @@ from .context import AppContext
 from .db import now_ms
 from .errors import safe_failure
 from .llm import validate_base_url
-from .memory import store
+from .memory import store, tree
 from .memory.retrieve import retrieve
 from .security import valid_id
 
@@ -181,7 +181,151 @@ async def conversation_delete(conversation_id: str, request: Request, with_summa
     return {"ok": True, "deleted": conversation_id, "with_summaries": with_summaries}
 
 
+# --------------------------------------------------------------------------- tasks
+@router.get("/tasks")
+async def tasks_list(request: Request, conversation_id: str = "", limit: int = 50):
+    ctx: AppContext = request.app.state.ctx
+    if ctx.tasks is None:
+        return _err(503, "task drafting is not running", "unavailable")
+    return {
+        "data": ctx.tasks.list(
+            conversation_id=conversation_id, limit=max(1, min(int(limit), 200))
+        )
+    }
+
+
+@router.post("/tasks")
+async def tasks_start(request: Request):
+    """Start a drafting job explicitly (the chat route auto-detects bulk jobs)."""
+    ctx: AppContext = request.app.state.ctx
+    if ctx.tasks is None:
+        return _err(503, "task drafting is not running", "unavailable")
+    try:
+        body = await request.json()
+    except Exception:
+        return _err(400, "request body is not valid JSON", "invalid_json")
+    conversation_id = str(body.get("conversation_id") or "")
+    instruction = str(body.get("instruction") or "").strip()
+    if not conversation_id or not instruction:
+        return _err(400, "conversation_id and instruction are required", "invalid_request")
+    document_ids = [str(d) for d in (body.get("document_ids") or [])]
+    if not document_ids:
+        document_ids = store.conversation_documents(ctx.db, conversation_id)
+    if not document_ids:
+        return _err(409, "attach at least one analysed document to this chat first", "no_documents")
+    topics = [str(t) for t in (body.get("topics") or [])]
+    try:
+        task = ctx.tasks.start(
+            conversation_id=conversation_id,
+            instruction=instruction,
+            topics=topics,
+            document_ids=document_ids,
+            model=str(body.get("model") or ""),
+            title=str(body.get("title") or ""),
+        )
+    except Exception as exc:
+        return _err(409, f"could not start the task ({exc})", "task_unavailable")
+    return {"ok": True, "task": task}
+
+
+@router.get("/tasks/{task_id}")
+async def tasks_detail(task_id: str, request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if ctx.tasks is None:
+        return _err(503, "task drafting is not running", "unavailable")
+    if not valid_id(task_id):
+        return _err(400, "invalid task id", "invalid_id")
+    task = ctx.tasks.get(task_id)
+    if task is None:
+        task_row = next(
+            (t for t in ctx.tasks.list(limit=200) if t["id"] == task_id), None
+        )
+        if task_row is None:
+            return _err(404, "task not found", "not_found")
+        task = task_row
+    return task
+
+
+@router.get("/tasks/{task_id}/draft")
+async def tasks_draft(task_id: str, request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if ctx.tasks is None:
+        return _err(503, "task drafting is not running", "unavailable")
+    if not valid_id(task_id):
+        return _err(400, "invalid task id", "invalid_id")
+    draft = ctx.tasks.draft(task_id)
+    if draft is None:
+        return _err(404, "task not found", "not_found")
+    return draft
+
+
+@router.post("/tasks/{task_id}/pause")
+async def tasks_pause(task_id: str, request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if ctx.tasks is None or not valid_id(task_id):
+        return _err(400, "invalid task", "invalid_id")
+    if not ctx.tasks.pause(task_id):
+        return _err(409, "only a queued or running task can be paused", "invalid_state")
+    return {"ok": True, "state": "paused"}
+
+
+@router.post("/tasks/{task_id}/resume")
+async def tasks_resume(task_id: str, request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if ctx.tasks is None or not valid_id(task_id):
+        return _err(400, "invalid task", "invalid_id")
+    if not ctx.tasks.resume(task_id):
+        return _err(409, "only a paused, interrupted or failed task can be resumed", "invalid_state")
+    return {"ok": True, "state": "running"}
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def tasks_cancel(task_id: str, request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if ctx.tasks is None or not valid_id(task_id):
+        return _err(400, "invalid task", "invalid_id")
+    if not ctx.tasks.cancel(task_id):
+        return _err(404, "task not found", "not_found")
+    return {"ok": True, "state": "cancelling"}
+
+
 # ------------------------------------------------------------------------- memory
+@router.get("/memory/trees")
+async def memory_trees(request: Request, kind: str = "", limit: int = 50):
+    ctx: AppContext = request.app.state.ctx
+    kind = kind.strip().lower()
+    if kind not in ("", "chat", "document"):
+        return _err(400, "kind must be chat or document", "invalid_kind")
+    return {
+        "data": tree.list_trees(
+            ctx.db, kind=kind or None, limit=max(1, min(int(limit), 200))
+        )
+    }
+
+
+@router.get("/memory/trees/{tree_id}")
+async def memory_tree_detail(tree_id: str, request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if not valid_id(tree_id):
+        return _err(400, "invalid tree id", "invalid_id")
+    detail = tree.outline(ctx.db, tree_id)
+    if not detail.get("tree"):
+        return _err(404, "tree not found", "not_found")
+    detail["stats"] = tree.stats(ctx.db, tree_id)
+    return detail
+
+
+@router.post("/memory/trees/{tree_id}/rollup")
+async def memory_tree_rollup(tree_id: str, request: Request, max_nodes: int = 6):
+    ctx: AppContext = request.app.state.ctx
+    if not valid_id(tree_id):
+        return _err(400, "invalid tree id", "invalid_id")
+    if ctx.trees is None:
+        return _err(503, "the tree builder is not running", "unavailable")
+    created = ctx.trees.drain(tree_id, max_nodes=max(1, min(int(max_nodes), 50)))
+    return {"ok": True, "created": created, "stats": tree.stats(ctx.db, tree_id)}
+
+
 @router.get("/memory/summaries")
 async def summaries(request: Request, limit: int = 50, offset: int = 0, topic: str | None = None):
     ctx: AppContext = request.app.state.ctx
@@ -1407,6 +1551,105 @@ async def document_job_cancel(job_id: str, request: Request):
     if not ctx.documents.cancel(job_id):
         return _err(404, "document job not found", "not_found")
     return {"ok": True}
+
+
+@router.post("/documents/jobs/{job_id}/pause")
+async def document_job_pause(job_id: str, request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if not ctx.documents:
+        return _documents_unavailable()
+    if not ctx.documents.pause(job_id):
+        return _err(409, "only a queued or running job can be paused", "invalid_state")
+    return {"ok": True, "state": "paused"}
+
+
+@router.post("/documents/jobs/{job_id}/resume")
+async def document_job_resume(job_id: str, request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if not ctx.documents:
+        return _documents_unavailable()
+    if not ctx.documents.resume(job_id):
+        return _err(409, "only a paused job can be resumed", "invalid_state")
+    return {"ok": True, "state": "running"}
+
+
+@router.get("/documents/options")
+async def document_options(request: Request, conversation_id: str = ""):
+    """List analysed documents and whether this chat has opted into each."""
+    ctx: AppContext = request.app.state.ctx
+    return {
+        "data": store.document_options(ctx.db, conversation_id),
+        "conversation_id": conversation_id,
+    }
+
+
+@router.get("/documents/{document_id}/pages")
+async def document_pages(
+    document_id: str,
+    request: Request,
+    first: int = 1,
+    last: int = 0,
+    limit: int = 40,
+):
+    """Read stored page notes directly. Multi-page ranges are returned in order."""
+    ctx: AppContext = request.app.state.ctx
+    if not valid_id(document_id):
+        return _err(400, "invalid document id", "invalid_id")
+    summary = store.get_summary(ctx.db, document_id)
+    if not summary or str(summary.get("kind") or "") != "document":
+        return _err(404, "document not found", "not_found")
+    low = max(1, int(first))
+    high = int(last) if int(last) >= low else low
+    cap = max(1, min(int(limit), 200))
+    if high - low + 1 > cap:
+        high = low + cap - 1
+    with ctx.db.read() as c:
+        rows = c.execute(
+            """SELECT page_no, text, tokens FROM document_pages
+               WHERE document_id=? AND page_no BETWEEN ? AND ?
+               ORDER BY page_no""",
+            (document_id, low, high),
+        ).fetchall()
+        total = c.execute(
+            "SELECT COUNT(*) FROM document_pages WHERE document_id=?", (document_id,)
+        ).fetchone()
+    return {
+        "document_id": document_id,
+        "title": summary.get("title"),
+        "first": low,
+        "last": high,
+        "pages_total": int(total[0]) if total else 0,
+        "pages": [
+            {"page_no": int(r["page_no"]), "text": str(r["text"]), "tokens": int(r["tokens"] or 0)}
+            for r in rows
+        ],
+    }
+
+
+@router.post("/documents/scope/{document_id}")
+async def document_scope_add(document_id: str, request: Request, conversation_id: str = ""):
+    """Opt this chat into a document. Only these documents are ever retrieved."""
+    ctx: AppContext = request.app.state.ctx
+    if not valid_id(document_id):
+        return _err(400, "invalid document id", "invalid_id")
+    if not conversation_id:
+        return _err(400, "conversation_id is required", "invalid_conversation")
+    summary = store.get_summary(ctx.db, document_id)
+    if not summary or str(summary.get("kind") or "") != "document":
+        return _err(404, "document not found", "not_found")
+    store.attach_document(ctx.db, conversation_id, document_id)
+    return {"ok": True, "attached": document_id, "conversation_id": conversation_id}
+
+
+@router.delete("/documents/scope/{document_id}")
+async def document_scope_remove(document_id: str, request: Request, conversation_id: str = ""):
+    ctx: AppContext = request.app.state.ctx
+    if not valid_id(document_id):
+        return _err(400, "invalid document id", "invalid_id")
+    if not conversation_id:
+        return _err(400, "conversation_id is required", "invalid_conversation")
+    removed = store.detach_document(ctx.db, conversation_id, document_id)
+    return {"ok": True, "removed": removed, "conversation_id": conversation_id}
 
 
 @router.post("/documents/analyze")

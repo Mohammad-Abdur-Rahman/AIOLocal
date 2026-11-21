@@ -695,3 +695,70 @@ def retrieval_plan(db: Database, request_id: str) -> dict | None:
     except json.JSONDecodeError:
         d["plan"] = {}
     return d
+
+
+# --------------------------------------------------------- document scope
+def attach_document(db: Database, conversation_id: str, document_id: str) -> None:
+    """Opt this chat into a document. Idempotent; never removes other documents."""
+    if not conversation_id or not document_id:
+        return
+    with db.write() as c:
+        c.execute(
+            """INSERT INTO conversation_documents(conversation_id, document_id, added_at)
+               VALUES(?,?,?)
+               ON CONFLICT(conversation_id, document_id) DO NOTHING""",
+            (conversation_id, document_id, now_ms()),
+        )
+
+
+def detach_document(db: Database, conversation_id: str, document_id: str) -> bool:
+    with db.write() as c:
+        cur = c.execute(
+            "DELETE FROM conversation_documents WHERE conversation_id=? AND document_id=?",
+            (conversation_id, document_id),
+        )
+    return cur.rowcount > 0
+
+
+def conversation_documents(db: Database, conversation_id: str) -> list[str]:
+    """Document ids this chat is allowed to read. Empty means none (opt-in)."""
+    if not conversation_id:
+        return []
+    with db.read() as c:
+        rows = c.execute(
+            """SELECT d.document_id FROM conversation_documents d
+               JOIN summaries s ON s.id=d.document_id AND s.merged_into IS NULL
+               WHERE d.conversation_id=? ORDER BY d.added_at""",
+            (conversation_id,),
+        ).fetchall()
+    return [str(r["document_id"]) for r in rows]
+
+
+def document_options(db: Database, conversation_id: str) -> list[dict]:
+    """Every analysed document, marked with whether this chat sees it."""
+    attached = set(conversation_documents(db, conversation_id))
+    with db.read() as c:
+        rows = c.execute(
+            """SELECT s.id, s.title, s.body, s.created_at,
+                      j.filename, j.state AS job_state, j.pages_total, j.pages_done
+               FROM summaries s
+               LEFT JOIN document_jobs j ON j.summary_id=s.id
+               WHERE s.kind='document' AND s.merged_into IS NULL
+               ORDER BY s.created_at DESC LIMIT 200""",
+        ).fetchall()
+    out = []
+    for row in rows:
+        body = str(row["body"] or "")
+        out.append(
+            {
+                "id": str(row["id"]),
+                "title": str(row["title"] or "Document"),
+                "filename": str(row["filename"] or ""),
+                "state": str(row["job_state"] or "done"),
+                "pages_total": int(row["pages_total"] or 0),
+                "pages_done": int(row["pages_done"] or 0),
+                "attached": str(row["id"]) in attached,
+                "partial": "Partial analysis" in body,
+            }
+        )
+    return out

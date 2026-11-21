@@ -4,6 +4,62 @@ All notable changes to AIO Local are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-20
+
+A memory redesign. The flat top-k index is still present as a fallback, but long-term
+memory now uses an append-only tree that never prunes and can be back-traced from a
+question to exact source units. Documents are stored as ordered pages with incremental
+notes, and exhaustive document tasks run as resumable background jobs. No new model or
+external service is required; existing databases are upgraded in place.
+
+### Added
+
+- **Append-only memory tree.** Every three complete units roll up into one summary
+  (chunks to degree-1, three degree-1 nodes to degree-2, and so on). Nodes and chunks
+  are immutable; a consumed unit keeps its row and its parent link forever.
+- **Beam back-trace retrieval.** A query is scored across several branches at each
+  level and descends to the exact chunk, returning the provenance path. Chat trees and
+  document trees are separate, so one cannot crowd out the other.
+- **Per-chat document opt-in.** A chat only sees documents the user attaches in the
+  chat menu. Document summaries and page excerpts are filtered at retrieval time, and
+  the Memory view lists the same document scope the model received.
+- **Page-addressed document memory.** A document is an ordered array of pages. Each
+  page note is appended with the previous note as context instead of rewriting the
+  whole document, and the overview is a roll-up of tree roots plus uncovered page
+  notes, giving every page exactly one place in the summary.
+- **Direct page queries.** "page 12", "pages 3-5" and inline forms resolve exact page
+  text, including several ranges in one request (capped at 200 pages).
+- **Resumable long tasks.** Exhaustive document jobs ("categorise every question")
+  route to a background worker that appends draft sections, stores the draft, keeps
+  only the unfinished segment in context, and continues from a persisted cursor after
+  pause, failure or restart. A final pass makes the accumulated draft presentable.
+- **Document pause.** Analyse jobs can be paused as well as cancelled, and resume
+  contiguously from the last completed page.
+- **Tree and task views.** The Memory view can browse tree outlines, node relevance and
+  provenance; the chat shows task progress with a draft viewer and pause/resume/cancel.
+- **Startup backfill.** Conversations and documents created before this release enter
+  their trees once, in the background, without blocking startup.
+
+### Changed
+
+- **Roll-ups never invent text.** If the model returns nothing, the chunks stay
+  unconsumed and a later drain retries. When a model is unavailable entirely, a
+  deterministic lossless digest preserves wording and provenance instead of guessing.
+- **Tree usage is recorded separately.** Retrieval feedback updates `tree_node_usage`,
+  so relevance can grow without rewriting a node.
+- **OVMS stops with the app.** The app-owned OVMS process is held in a Windows job
+  object with kill-on-close, plus a PID file, `atexit` and console-control handlers.
+  An external OVMS the app did not start is left running.
+
+### Fixed
+
+- A failed task segment no longer advances the cursor or silently skips work; retry
+  continues from the same unit and appends to the existing draft.
+- A paused task no longer restarts from the wrong ordinal; draft sections are numbered
+  by what was written, not by cursor position.
+- Document overviews no longer re-summarise the whole document (the main source of
+  invented content) and partial jobs report honestly which pages are missing.
+
 ## [0.2.1] - 2026-11-18
 
 A bug-fix release for memory deletion, document storage, knowledge folders and
@@ -121,5 +177,6 @@ First public release: local chat through OVMS, exact and summary memory, the
 Knowledge library, image generation, model management, the GIMP dock, and a
 Linux source-build path.
 
+[0.3.0]: https://github.com/Mohammad-Abdur-Rahman/AIOLocal/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Mohammad-Abdur-Rahman/AIOLocal/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Mohammad-Abdur-Rahman/AIOLocal/releases/tag/v0.2.0

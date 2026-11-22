@@ -50,6 +50,12 @@ external service is required; existing databases are upgraded in place.
 - **OVMS stops with the app.** The app-owned OVMS process is held in a Windows job
   object with kill-on-close, plus a PID file, `atexit` and console-control handlers.
   An external OVMS the app did not start is left running.
+- **Document analysis spends its time on facts, not formatting.** Each page is read
+  with streaming already off and thinking disabled; the prompt now asks for compact,
+  non-repetitive notes and no longer generates a redundant per-page "Visible points"
+  list. The PDF is opened once per job instead of once per page. Output is unchanged
+  in substance - every visible fact is still transcribed - with less generation per
+  page, so large documents finish sooner.
 
 ### Fixed
 

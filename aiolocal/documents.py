@@ -53,10 +53,15 @@ VISION_SYSTEM = (
     "positioning precisely: where each block sits (top, bottom, left, right, "
     "centre), what diagrams contain (axes, labels, arrows, relative positions), "
     "table row/column order, and the overall visual structure. If a region is "
-    "cut off, blurry or unreadable, say which region and do not guess."
+    "cut off, blurry or unreadable, say which region and do not guess.\n\n"
+    "Write compactly: plain Markdown with no blank lines between points, no "
+    "decorative headings and no repetition. Spend the words on facts, not "
+    "formatting, and state each fact once."
 )
 
 BATCH_PROMPT = """Index page(s) {first}-{last} of "{title}" for long-term memory.
+
+Start directly with the "Page {first}" heading; no preamble.
 
 For EACH page, write a section exactly like "Page N" and cover only what is visible:
 - the subject and purpose of the page;
@@ -65,9 +70,9 @@ For EACH page, write a section exactly like "Page N" and cover only what is visi
 - equations or code: transcribe them exactly; do not solve or complete them;
 - anything a reader would need to find this page again (terms, titles, headings).
 
-Finish the whole answer with a "Visible points" bullet list of the five most
-important things actually shown across these pages. Do not infer beyond the
-page. If a page is blank or illegible, say so instead of guessing."""
+Write each fact once, in the place it belongs; do not repeat it in a separate
+summary or bullet list. Do not infer beyond the page. If a page is blank or
+illegible, say so instead of guessing."""
 
 PARTIAL_PROMPT = """This document analysis was interrupted after {done} of {total} pages.
 
@@ -159,6 +164,9 @@ class DocumentAnalyzer:
         self._lock = threading.RLock()
         self._jobs: dict[str, DocumentJob] = {}
         self._threads: dict[str, threading.Thread] = {}
+        # One open PDF per analysed path, reused across pages instead of
+        # reopening the file for every page (a 584-page job opened it 584 times).
+        self._pdf_docs: dict[str, object] = {}
         self._closing = False
         self._pending: list[DocumentJob] = []
         if not self.deferred:
@@ -189,6 +197,8 @@ class DocumentAnalyzer:
             threads = list(self._threads.values())
         for thread in threads:
             thread.join(timeout=2.0)
+        for path in list(self._pdf_docs):
+            self._release_pdf(path)
         with self._lock:
             for job in self._jobs.values():
                 if job.state in ("queued", "running"):
@@ -375,22 +385,19 @@ class DocumentAnalyzer:
     def _run(self, job: DocumentJob) -> None:
         settings = self.settings_store.load()
         try:
-            import pypdfium2 as pdfium
-
-            pdf = pdfium.PdfDocument(job.path)
-            try:
-                total = len(pdf)
-            finally:
-                pdf.close()
+            pdf = self._get_pdf(job.path)
+            total = len(pdf)
             if total <= 0:
                 raise DocumentError("this PDF has no pages")
             # Every page is analysed. There is deliberately no page cap: a large
             # document is resumable, so stopping at an arbitrary page loses value.
             job.pages_total = total
         except DocumentError as exc:
+            self._release_pdf(job.path)
             self._fail(job, str(exc))
             return
         except Exception as exc:
+            self._release_pdf(job.path)
             self._fail(job, f"could not open the PDF ({type(exc).__name__}: {exc})")
             return
 
@@ -506,6 +513,9 @@ class DocumentAnalyzer:
             self._save_job(job)
             self._emit(job)
         finally:
+            # Release the cached PDF handle before the file can be deleted so
+            # Windows does not keep a lock on the uploaded document.
+            self._release_pdf(job.path)
             with self._lock:
                 self._threads.pop(job.id, None)
             if job.state == "done" and not settings.document_keep_pages:
@@ -930,30 +940,51 @@ class DocumentAnalyzer:
             trust_env=False,
         )
 
-    def _render_pages(self, path: str, first: int, last: int, dpi: int) -> list[bytes]:
+    def _get_pdf(self, path: str):
+        """Open a PDF once per path and reuse it across pages.
+
+        Reopening the file for every page is pure overhead on a large document
+        and holds no accuracy benefit. Each analysed upload has a unique path, so
+        one cached handle per path is never shared between jobs.
+        """
         import pypdfium2 as pdfium
 
+        key = str(path)
+        with self._lock:
+            pdf = self._pdf_docs.get(key)
+            if pdf is None:
+                pdf = pdfium.PdfDocument(key)
+                self._pdf_docs[key] = pdf
+            return pdf
+
+    def _release_pdf(self, path: str) -> None:
+        with self._lock:
+            pdf = self._pdf_docs.pop(str(path), None)
+        if pdf is not None:
+            try:
+                pdf.close()
+            except Exception:
+                pass
+
+    def _render_pages(self, path: str, first: int, last: int, dpi: int) -> list[bytes]:
         images: list[bytes] = []
-        pdf = pdfium.PdfDocument(path)
-        try:
-            for index in range(first - 1, last):
-                page = pdf[index]
-                bitmap = None
-                pil = None
-                try:
-                    bitmap = page.render(scale=max(1.0, dpi / 72.0))
-                    pil = bitmap.to_pil().convert("RGB")
-                    buffer = io.BytesIO()
-                    pil.save(buffer, format="JPEG", quality=84, optimize=True)
-                    images.append(buffer.getvalue())
-                finally:
-                    if pil is not None:
-                        pil.close()
-                    if bitmap is not None:
-                        bitmap.close()
-                    page.close()
-        finally:
-            pdf.close()
+        pdf = self._get_pdf(path)
+        for index in range(first - 1, last):
+            page = pdf[index]
+            bitmap = None
+            pil = None
+            try:
+                bitmap = page.render(scale=max(1.0, dpi / 72.0))
+                pil = bitmap.to_pil().convert("RGB")
+                buffer = io.BytesIO()
+                pil.save(buffer, format="JPEG", quality=84, optimize=True)
+                images.append(buffer.getvalue())
+            finally:
+                if pil is not None:
+                    pil.close()
+                if bitmap is not None:
+                    bitmap.close()
+                page.close()
         return images
 
     def _vision_batch(

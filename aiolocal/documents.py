@@ -139,6 +139,7 @@ class DocumentAnalyzer:
         publish: Callable[[str, dict], None] | None = None,
         models=None,
         trees=None,
+        deferred: bool = False,
     ) -> None:
         self.paths = paths
         self.settings_store = settings_store
@@ -150,13 +151,34 @@ class DocumentAnalyzer:
         # TreeBuilder: page notes are also written into an append-only document
         # tree so summaries roll up and queries can back-trace to one page.
         self.trees = trees
+        # A restored analyzer must not resume jobs until OVMS has had a chance to
+        # start: otherwise every launch fires vision calls at a stopped server.
+        self.deferred = bool(deferred)
         self.dir = paths.data_dir / "documents"
         self.dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._jobs: dict[str, DocumentJob] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._closing = False
-        self._restore()
+        self._pending: list[DocumentJob] = []
+        if not self.deferred:
+            self._restore()
+
+    def resume_pending(self) -> None:
+        """Start restored jobs once the app's startup sequence allows it."""
+        with self._lock:
+            if not self.deferred or self._closing:
+                return
+            self.deferred = False
+            pending, self._pending = self._pending, []
+        for job in pending:
+            job.state = "queued"
+            with self._lock:
+                thread = threading.Thread(
+                    target=self._run, args=(job,), name=f"doc-{job.id}", daemon=True
+                )
+                self._threads[job.id] = thread
+            thread.start()
 
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
@@ -263,6 +285,12 @@ class DocumentAnalyzer:
                     job.state = "interrupted"
                     job.error = "the uploaded file is no longer available; attach it again to continue"
                     self._save_job(job)
+        if self.deferred:
+            # The caller resumes these after OVMS has started; starting them now
+            # would race the model server during launch.
+            with self._lock:
+                self._pending = resumable
+            return
         for job in resumable:
             job.state = "queued"
             with self._lock:

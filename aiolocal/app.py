@@ -157,7 +157,14 @@ def create_app(
 
         gimp = GimpDock(paths, settings_store, image_lookup=lookup_image)
         documents = DocumentAnalyzer(
-            paths, settings_store, db, publish=bus.publish, models=models, trees=trees
+            paths,
+            settings_store,
+            db,
+            publish=bus.publish,
+            models=models,
+            trees=trees,
+            # Restored jobs wait until OVMS auto-start has been attempted.
+            deferred=True,
         )
         ctx = AppContext(
             paths=paths,
@@ -224,6 +231,13 @@ def create_app(
                 log.info("OVMS auto-start requested")
             except Exception:
                 log.exception("OVMS auto-start failed")
+            finally:
+                # Resuming after this point means a stopped server produces one
+                # clean failure, not a race on every launch.
+                try:
+                    documents.resume_pending()
+                except Exception:
+                    log.exception("could not resume document jobs after startup")
 
         threading.Thread(target=_auto_start_ovms, name="ovms-autostart", daemon=True).start()
         try:

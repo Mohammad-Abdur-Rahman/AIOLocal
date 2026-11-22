@@ -59,6 +59,9 @@ external service is required; existing databases are upgraded in place.
   by what was written, not by cursor position.
 - Document overviews no longer re-summarise the whole document (the main source of
   invented content) and partial jobs report honestly which pages are missing.
+- Restored document jobs now wait until OVMS has started before resuming, so a launch
+  against a stopped model server produces one clean failure instead of a race on every
+  start.
 
 ## [0.2.1] - 2026-11-18
 

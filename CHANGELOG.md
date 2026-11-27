@@ -6,6 +6,11 @@ All notable changes to AIO Local are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-28
+
+Security hardening. No new model or external service is required; upgrade from
+0.4.0 is a drop-in replacement.
+
 ### Security
 
 - Topic-list parsing no longer uses a pattern that could backtrack polynomially on

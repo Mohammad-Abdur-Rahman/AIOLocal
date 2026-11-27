@@ -9,6 +9,7 @@ stops clients from injecting their own RAG blocks.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import AsyncIterator
@@ -18,6 +19,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .context import AppContext
+from .errors import safe_failure
 from .llm import UpstreamError
 from .memory import store, semantic
 from .memory.assemble import InputTooLarge, assemble
@@ -28,6 +30,8 @@ from .security import valid_id
 from .tasks import looks_like_bulk_task, looks_like_strict_index
 
 router = APIRouter()
+
+log = logging.getLogger(__name__)
 
 _SIDE_HINTS = (
     "generate a title",
@@ -51,18 +55,56 @@ def _error(status: int, message: str, code: str, kind: str = "invalid_request_er
 
 
 def _upstream_message(exc: UpstreamError, model: str = "") -> str:
-    """Translate OVMS's cryptic MediaPipe 404 into something actionable."""
+    """Translate a model-server failure into something actionable.
+
+    The server's raw reply can name internal files and graphs, so it is logged
+    and classified rather than echoed to the caller. Only the recognised
+    categories below reach the HTTP response.
+    """
     text = str(getattr(exc, "message", "") or "")
+    log.warning(
+        "upstream error %s: %s",
+        getattr(exc, "status", ""),
+        text[:500],
+    )
+    lowered = text.lower()
+    name = model or "the selected model"
     if "ediapipe graph definition" in text or "graph definition with requested name" in text:
-        name = model or "the selected model"
         return (
             f"{name} is not loaded in the local model server, so the request could "
             "not be served. Load it in Models, or pick a loaded model in the Chat "
             "dropdown (the whole app follows that choice)."
         )
+    if "out of memory" in lowered or "insufficient memory" in lowered or "oom" in lowered:
+        return (
+            f"{name} ran out of memory in the local model server. Close other apps or "
+            "pick a smaller model, then try again."
+        )
+    if "timed out" in lowered or "timeout" in lowered:
+        return f"{name} did not answer in time. Try again, or pick a smaller model."
+    status = int(getattr(exc, "status", 0) or 0)
+    if status in (401, 403):
+        return (
+            "The local model server refused the request. Check that OVMS is running "
+            "with the expected API key."
+        )
+    if status == 404:
+        return (
+            f"{name} was not found in the local model server. Load it in Models, or "
+            "pick a loaded model in the Chat dropdown."
+        )
     return (
-        f"The local model server rejected the request: {text}. "
-        "Check that OVMS is running and the model is loaded."
+        "The local model server rejected the request. Check that OVMS is running and "
+        "that the model is loaded; the server's reply is in the app log."
+    )
+
+
+def _unreachable(ctx: AppContext, exc: BaseException) -> str:
+    """Message for a connection failure: the exception goes to the log only."""
+    safe_failure(exc, "reaching the local model server", "unreachable")
+    return (
+        f"Cannot reach the local model server at {ctx.settings.upstream_base_url}. "
+        "Start OVMS or change the upstream URL in Settings."
     )
 
 
@@ -527,6 +569,7 @@ async def _prepare(
     if mode not in ("chat", "code", "document", "re", "medical"):
         mode = "chat"
 
+    overflow: dict = {}
     try:
         prompt_messages, plan = assemble(
             ctx.settings,
@@ -537,14 +580,23 @@ async def _prepare(
             mode=mode,
             request_id=request_id,
             extra_context=_build_extra_context(kb_items, web_results),
+            overflow=overflow,
         )
     except InputTooLarge as exc:
-        return _error(
-            413,
-            f"Your message is too large for this model's context window ({exc.needed} tokens "
-            f"needed, {exc.available} available). Increase the context setting or shorten it.",
-            "context_overflow",
-        )
+        needed = int(overflow.get("needed") or 0)
+        available = int(overflow.get("available") or 0)
+        if needed and available:
+            message = (
+                f"Your message is too large for this model's context window "
+                f"({needed} tokens needed, {available} available). Increase the "
+                "context setting or shorten it."
+            )
+        else:
+            message = (
+                "Your message is too large for this model's context window. "
+                "Increase the context setting or shorten it."
+            )
+        return _error(413, safe_failure(exc, "assembling the prompt", message), "context_overflow")
 
     plan["retrieval"] = result.plan
     plan["conversation_id"] = conversation_id
@@ -598,7 +650,10 @@ def _bulk_pages(ctx: AppContext, document_ids: list[str]) -> int:
     return int(row[0]) if row else 0
 
 
-_TOPIC_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+(?P<name>.+?)\s*$")
+_TOPIC_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+(?P<name>\S.*)")
+# A topic list is pasted text, so a line can be arbitrarily long. Cap the work
+# per line: anything past this is not a topic name (names are capped at 80).
+_MAX_BULLET_LINE = 400
 
 
 def _extract_topics(text: str) -> list[str]:
@@ -607,9 +662,16 @@ def _extract_topics(text: str) -> list[str]:
     Handles bullet, dot and asterisk lists plus "1. Topic" / "1) Topic" numbering,
     which is how a long category list is usually pasted. Short fragments only, so
     an ordinary numbered step in the instruction is not mistaken for a topic.
+
+    The pattern is written so matching stays linear in the line length: the name
+    starts on a non-space character and runs to the end of the line, so there is
+    no whitespace repetition for the engine to backtrack over (that shape was
+    flagged as a polynomial regular expression on user-provided text).
     """
     topics: list[str] = []
     for line in text.splitlines():
+        if len(line) > _MAX_BULLET_LINE:
+            continue
         match = _TOPIC_BULLET_RE.match(line)
         if not match:
             continue
@@ -678,7 +740,16 @@ def _maybe_start_task(
             title=user_text.strip().splitlines()[0][:100],
         )
     except Exception as exc:
-        return _error(409, f"could not start the task ({exc})", "task_unavailable")
+        return _error(
+            409,
+            safe_failure(
+                exc,
+                "starting the classification task",
+                "The task could not be started. Check that a document is attached "
+                "and that a model is loaded, then try again.",
+            ),
+            "task_unavailable",
+        )
 
     content = (
         (
@@ -815,8 +886,7 @@ async def chat_completions(request: Request):
         except httpx.HTTPError as exc:
             return _error(
                 503,
-                f"Cannot reach the local model server at {ctx.settings.upstream_base_url} "
-                f"({type(exc).__name__}). Start OVMS or change the upstream URL in Settings.",
+                _unreachable(ctx, exc),
                 "upstream_unavailable",
                 "upstream_error",
             )
@@ -838,8 +908,7 @@ async def chat_completions(request: Request):
     except httpx.HTTPError as exc:
         return _error(
             503,
-            f"Cannot reach the local model server at {ctx.settings.upstream_base_url} "
-            f"({type(exc).__name__}). Start OVMS or change the upstream URL in Settings.",
+            _unreachable(ctx, exc),
             "upstream_unavailable",
             "upstream_error",
         )
@@ -956,7 +1025,7 @@ async def _passthrough(ctx: AppContext, body: dict):
         except UpstreamError as exc:
             return _error(502, _upstream_message(exc, str(payload.get("model") or "")), "upstream_error", "upstream_error")
         except httpx.HTTPError as exc:
-            return _error(503, f"Cannot reach the model server ({type(exc).__name__}).", "upstream_unavailable", "upstream_error")
+            return _error(503, _unreachable(ctx, exc), "upstream_unavailable", "upstream_error")
 
         async def relay() -> AsyncIterator[bytes]:
             try:
@@ -972,7 +1041,7 @@ async def _passthrough(ctx: AppContext, body: dict):
     except UpstreamError as exc:
         return _error(502, _upstream_message(exc, str(payload.get("model") or "")), "upstream_error", "upstream_error")
     except httpx.HTTPError as exc:
-        return _error(503, f"Cannot reach the model server ({type(exc).__name__}).", "upstream_unavailable", "upstream_error")
+        return _error(503, _unreachable(ctx, exc), "upstream_unavailable", "upstream_error")
 
 
 @router.get("/v1/models")

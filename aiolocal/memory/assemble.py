@@ -230,22 +230,32 @@ def assemble(
     extra_context: str = "",
     mode: str = "chat",
     request_id: str | None = None,
+    overflow: dict | None = None,
 ) -> tuple[list[dict], dict]:
     tool_chain = list(tool_chain or [])
     history = list(history or [])
     items = list(items or [])
+
+    def _too_large(needed: int, available_tokens: int) -> InputTooLarge:
+        # The counts are copied out here so callers can describe the overflow
+        # without reading attributes off the exception (which would leak
+        # exception detail into an HTTP response).
+        if overflow is not None:
+            overflow["needed"] = needed
+            overflow["available"] = available_tokens
+        return InputTooLarge(needed, available_tokens)
 
     output_tokens = max(16, settings.max_output_tokens or settings.output_reserve_tokens)
     base_system = _render_system(settings, [], [], mode) + (extra_context or "")
     system_tokens = estimate_tokens(base_system) + 64  # headers + safety margin
     available = settings.context_tokens - output_tokens - system_tokens
     if available < 256:
-        raise InputTooLarge(estimate_tokens(user_text), max(0, available))
+        raise _too_large(estimate_tokens(user_text), max(0, available))
 
     input_tokens = estimate_tokens(user_text)
     tool_tokens = sum(estimate_tokens(m.get("content", "") or "") for m in tool_chain)
     if input_tokens + tool_tokens > available:
-        raise InputTooLarge(input_tokens + tool_tokens, available)
+        raise _too_large(input_tokens + tool_tokens, available)
 
     remaining = available - input_tokens - tool_tokens
 
@@ -319,7 +329,7 @@ def assemble(
             chosen_history.pop(0)
             trims.append("history")
         else:
-            raise InputTooLarge(input_tokens + tool_tokens, available)
+            raise _too_large(input_tokens + tool_tokens, available)
 
     rendered = _render_system(settings, chosen_memory, chosen_history, mode)
 

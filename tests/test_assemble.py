@@ -44,6 +44,15 @@ def test_current_message_wins_and_oversize_is_rejected():
         assemble(settings, user_text=huge)
 
 
+def test_oversize_reports_its_counts_without_the_exception():
+    settings = Settings(context_tokens=1024, max_output_tokens=200)
+    report: dict = {}
+    with pytest.raises(InputTooLarge):
+        assemble(settings, user_text="word " * 5000, overflow=report)
+
+    assert report["needed"] > report["available"] > 0
+
+
 def test_tool_chain_is_preserved():
     settings = Settings(context_tokens=4096, max_output_tokens=256)
     tool_chain = [

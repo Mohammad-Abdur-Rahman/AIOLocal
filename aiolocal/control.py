@@ -224,7 +224,16 @@ async def tasks_start(request: Request):
             title=str(body.get("title") or ""),
         )
     except Exception as exc:
-        return _err(409, f"could not start the task ({exc})", "task_unavailable")
+        return _err(
+            409,
+            safe_failure(
+                exc,
+                "starting the task",
+                "The task could not be started. Check that a document is attached "
+                "and that a model is loaded, then try again.",
+            ),
+            "task_unavailable",
+        )
     return {"ok": True, "task": task}
 
 

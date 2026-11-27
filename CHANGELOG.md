@@ -6,6 +6,19 @@ All notable changes to AIO Local are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Topic-list parsing no longer uses a pattern that could backtrack polynomially on
+  crafted input (CodeQL `py/polynomial-redos`). A pasted line is capped at 400
+  characters and the name now starts on a non-space character, so matching stays
+  linear.
+- Error replies no longer echo exception text (CodeQL `py/stack-trace-exposure` in
+  `aiolocal/gateway.py` and `aiolocal/control.py`). Model-server failures are
+  classified into known categories (missing graph, out of memory, timeout, HTTP
+  status) and the raw reply is logged instead of returned; task-start failures use a
+  curated message. The context-overflow reply still reports its token counts, now
+  taken from a plain dict rather than exception attributes.
+
 ## [0.4.0] - 2026-11-23
 
 Fast document analysis, strict page classification, and complete memory deletion.

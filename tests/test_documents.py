@@ -10,7 +10,7 @@ from pypdf import PdfWriter
 
 from aiolocal.config import Paths, Settings, SettingsStore
 from aiolocal.db import Database
-from aiolocal.documents import DocumentAnalyzer, DocumentError
+from aiolocal.documents import DocumentAnalyzer, DocumentError, PageExtract
 from aiolocal.memory import store
 
 
@@ -90,6 +90,60 @@ def test_pdf_is_analysed_one_page_per_call(tmp_path: Path):
         ).fetchone()[0]
     assert pages == 5
     assert sections == 1
+
+
+def test_page_with_good_text_keeps_it_and_only_adds_visual_notes(tmp_path: Path):
+    """A diagram page must not throw away a reliable text layer."""
+    analyzer, db, _ = make_analyzer(tmp_path)
+    pdf = make_pdf(tmp_path / "diagram.pdf", pages=2)
+
+    analyzer._extract_text = lambda path, first, last, vision_mode: PageExtract(
+        markdown="Q4. The graph of y = x^2 is drawn below.", needs_vision=True, native=True
+    )
+    analyzer._render_pages = lambda path, first, last, dpi: [b"image"]
+    analyzer._vision_batch = lambda *args, **kwargs: pytest.fail("full transcription used")
+    analyzer._vision_notes = lambda settings, model, title, page_no, image, native: (
+        "Diagram: upward parabola with vertex at the origin."
+    )
+
+    job = analyzer.start(pdf, "diagram.pdf")
+    current = wait_for(analyzer, job["id"])
+    assert current["state"] == "done", current
+
+    with db.read() as c:
+        rows = c.execute(
+            "SELECT page_no, text FROM document_pages WHERE document_id=? ORDER BY page_no",
+            (current["summary_id"],),
+        ).fetchall()
+    assert len(rows) == 2
+    assert "Q4. The graph of y = x^2 is drawn below." in rows[0]["text"]
+    assert "Visual notes." in rows[0]["text"]
+    assert "upward parabola" in rows[0]["text"]
+
+
+def test_scanned_page_is_transcribed_from_the_image(tmp_path: Path):
+    """A page with no text layer still gets a full vision transcription."""
+    analyzer, db, _ = make_analyzer(tmp_path)
+    pdf = make_pdf(tmp_path / "scan.pdf", pages=1)
+
+    analyzer._extract_text = lambda path, first, last, vision_mode: PageExtract(
+        native=False, needs_vision=True
+    )
+    analyzer._render_pages = lambda path, first, last, dpi: [b"image"]
+    analyzer._vision_notes = lambda *args, **kwargs: pytest.fail("hybrid used on a scan")
+    analyzer._vision_batch = lambda settings, model, title, first, last, images: (
+        "Page 1: a scanned page of notes."
+    )
+
+    job = analyzer.start(pdf, "scan.pdf")
+    current = wait_for(analyzer, job["id"])
+    assert current["state"] == "done", current
+    with db.read() as c:
+        text = c.execute(
+            "SELECT text FROM document_pages WHERE document_id=? AND page_no=1",
+            (current["summary_id"],),
+        ).fetchone()["text"]
+    assert text.strip() == "Page 1: a scanned page of notes."
 
 
 def test_page_rows_survive_and_are_retrievable(tmp_path: Path):

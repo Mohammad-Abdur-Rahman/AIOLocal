@@ -6,6 +6,7 @@ import json
 import sqlite3
 from typing import Any, Iterable
 
+from . import tree
 from .text import content_hash, embed, estimate_tokens, new_id, pack
 
 from ..db import Database, json_dumps, now_ms
@@ -115,6 +116,14 @@ def _delete_summary_rows(c: sqlite3.Connection, summary_id: str) -> list[str]:
     c.execute("DELETE FROM document_pages WHERE document_id=?", (summary_id,))
     c.execute("DELETE FROM document_sections WHERE document_id=?", (summary_id,))
     c.execute("DELETE FROM document_jobs WHERE summary_id=?", (summary_id,))
+    # A document owns its tree, so deleting the document must not leave a tree
+    # behind whose pages no longer exist. The tombstone is dropped with the ref.
+    for row in c.execute(
+        "SELECT id FROM memory_trees WHERE kind='document' AND ref_id=?",
+        (summary_id,),
+    ).fetchall():
+        tree.delete_tree_rows(c, str(row["id"]))
+    tree.clear_tombstone(c, kind="document", ref_id=summary_id)
     c.execute("DELETE FROM summary_messages WHERE summary_id=?", (summary_id,))
     c.execute(
         "DELETE FROM summary_edges WHERE src=? OR dst=?", (summary_id, summary_id)
@@ -204,6 +213,14 @@ def delete_conversation(
                 if linked and linked.issubset(message_set):
                     _delete_summary_rows(c, summary_id)
         _delete_message_rows(c, message_ids)
+        # The chat's tree is part of the chat. Leaving it behind is what made a
+        # deleted conversation still look like available memory in the tree view.
+        for row in c.execute(
+            "SELECT id FROM memory_trees WHERE kind='chat' AND ref_id=?",
+            (conversation_id,),
+        ).fetchall():
+            tree.delete_tree_rows(c, str(row["id"]))
+        tree.clear_tombstone(c, kind="chat", ref_id=conversation_id)
         c.execute("DELETE FROM retrieval_log WHERE conversation_id=?", (conversation_id,))
         c.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
         c.execute(

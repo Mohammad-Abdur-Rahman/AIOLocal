@@ -221,9 +221,18 @@
       <div class="card">
         <div class="section-head tight">
           <h2>Memory tree</h2>
-          <select id="tree-select" class="compact-select"><option value="">All trees</option></select>
+          <div class="row wrap">
+            <select id="tree-kind" class="compact-select">
+              <option value="">All trees</option>
+              <option value="chat">Chat trees</option>
+              <option value="document">Document trees</option>
+            </select>
+            <select id="tree-select" class="compact-select"><option value="">Choose a tree</option></select>
+            <button id="tree-delete" class="btn ghost small" type="button">Delete tree</button>
+            <button id="tree-clear" class="btn ghost small" type="button">Delete all shown</button>
+          </div>
         </div>
-        <p class="muted small">This is the exact structure retrieval walks: chunks roll up 3-at-a-time, and a query back-traces through the summaries to the source chunks. Nothing is pruned.</p>
+        <p class="muted small">This is the exact structure retrieval walks: chunks roll up 3-at-a-time, and a query back-traces through the summaries to the source chunks. Nothing is pruned unless you delete a tree.</p>
         <div id="tree-detail" class="tree-detail"></div>
       </div>
 
@@ -638,6 +647,12 @@
 
         <h2>Documents</h2>
         <label>Docling executable (optional PDF fallback)<input id="set-docling" type="text" placeholder="docling"></label>
+        <label>MinerU executable (optional PDF fallback)<input id="set-mineru" type="text" placeholder="mineru"></label>
+        <label>Document vision mode<select id="set-doc-vision-mode">
+          <option value="auto">auto</option>
+          <option value="all">all</option>
+          <option value="off">off</option>
+        </select></label>
 
         <h2>Code (OpenCode)</h2>
         <div class="row">

@@ -21,6 +21,7 @@ def test_schema_has_tree_scope_and_task_tables(tmp_path: Path):
         }
     for table in (
         "memory_trees",
+        "memory_tree_tombstones",
         "tree_nodes",
         "tree_chunks",
         "tree_node_usage",
@@ -32,7 +33,7 @@ def test_schema_has_tree_scope_and_task_tables(tmp_path: Path):
         assert table in names
     with db.read() as c:
         version = int(c.execute("PRAGMA user_version").fetchone()[0])
-    assert version == SCHEMA_VERSION == 5
+    assert version == SCHEMA_VERSION == 6
 
 
 def test_old_database_is_upgraded_in_place(tmp_path: Path):

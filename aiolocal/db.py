@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -208,6 +208,16 @@ CREATE TABLE IF NOT EXISTS memory_trees (
   updated_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_tree_kind ON memory_trees(kind, updated_at DESC);
+
+-- A deleted tree leaves a tombstone so the startup backfill cannot recreate it
+-- from chat messages or document pages the user asked to forget. Live activity
+-- after the delete still creates a fresh tree; only automatic re-import is off.
+CREATE TABLE IF NOT EXISTS memory_tree_tombstones (
+  kind       TEXT NOT NULL,                  -- chat | document
+  ref_id     TEXT NOT NULL,                  -- conversation id or document summary id
+  deleted_at INTEGER NOT NULL,
+  PRIMARY KEY (kind, ref_id)
+);
 
 CREATE TABLE IF NOT EXISTS tree_nodes (
   id          TEXT PRIMARY KEY,

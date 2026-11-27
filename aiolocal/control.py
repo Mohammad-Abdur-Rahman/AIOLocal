@@ -326,6 +326,28 @@ async def memory_tree_rollup(tree_id: str, request: Request, max_nodes: int = 6)
     return {"ok": True, "created": created, "stats": tree.stats(ctx.db, tree_id)}
 
 
+@router.delete("/memory/trees/{tree_id}")
+async def memory_tree_delete(tree_id: str, request: Request):
+    ctx: AppContext = request.app.state.ctx
+    if not valid_id(tree_id):
+        return _err(400, "invalid tree id", "invalid_id")
+    result = tree.delete_tree(ctx.db, tree_id)
+    if not result:
+        return _err(404, "tree not found", "not_found")
+    return {"ok": True, **result}
+
+
+@router.post("/memory/trees/clear")
+async def memory_trees_clear(request: Request, kind: str = ""):
+    """Delete every chat or document tree (both when kind is empty)."""
+    ctx: AppContext = request.app.state.ctx
+    kind = kind.strip().lower()
+    if kind not in ("", "chat", "document"):
+        return _err(400, "kind must be chat, document or empty", "invalid_kind")
+    result = tree.delete_trees(ctx.db, kind=kind or None)
+    return {"ok": True, **result}
+
+
 @router.get("/memory/summaries")
 async def summaries(request: Request, limit: int = 50, offset: int = 0, topic: str | None = None):
     ctx: AppContext = request.app.state.ctx

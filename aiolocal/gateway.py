@@ -25,7 +25,7 @@ from .memory import treebuild, tree
 from .memory.retrieve import retrieve
 from .memory.text import content_hash, new_id, normalise, truncate_tokens
 from .security import valid_id
-from .tasks import looks_like_bulk_task
+from .tasks import looks_like_bulk_task, looks_like_strict_index
 
 router = APIRouter()
 
@@ -598,6 +598,35 @@ def _bulk_pages(ctx: AppContext, document_ids: list[str]) -> int:
     return int(row[0]) if row else 0
 
 
+_TOPIC_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+(?P<name>.+?)\s*$")
+
+
+def _extract_topics(text: str) -> list[str]:
+    """Pull a user's topic list out of a message.
+
+    Handles bullet, dot and asterisk lists plus "1. Topic" / "1) Topic" numbering,
+    which is how a long category list is usually pasted. Short fragments only, so
+    an ordinary numbered step in the instruction is not mistaken for a topic.
+    """
+    topics: list[str] = []
+    for line in text.splitlines():
+        match = _TOPIC_BULLET_RE.match(line)
+        if not match:
+            continue
+        name = match.group("name").strip().strip("*`")
+        if 2 < len(name) <= 80:
+            topics.append(name)
+    # De-duplicate while keeping the author's order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for name in topics:
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(name)
+    return unique[:40]
+
+
 def _maybe_start_task(
     ctx: AppContext, body: dict, request: Request, messages: list[dict]
 ):
@@ -620,17 +649,15 @@ def _maybe_start_task(
     conversation_id = resolve_conversation(ctx, body, request.headers)
     document_ids = store.conversation_documents(ctx.db, conversation_id)
     forced = headers.get("x-aio-task") == "1"
-    if not forced and not looks_like_bulk_task(
-        user_text, total_pages=_bulk_pages(ctx, document_ids)
+    total_pages = _bulk_pages(ctx, document_ids)
+    topics = _extract_topics(user_text)
+    strict = looks_like_strict_index(user_text, total_pages, topics)
+    if not forced and not strict and not looks_like_bulk_task(
+        user_text, total_pages=total_pages
     ):
         return None
     if not document_ids:
         return None
-    topics = [
-        line.strip(" -•\t")
-        for line in user_text.splitlines()
-        if line.strip().startswith(("-", "•")) and len(line.strip()) > 2
-    ][:40]
     request_id = new_id()
     user_msg_id, _ = store.archive_message(
         ctx.db,
@@ -654,15 +681,28 @@ def _maybe_start_task(
         return _error(409, f"could not start the task ({exc})", "task_unavailable")
 
     content = (
-        "I started a working draft for this long task because it covers more pages "
-        "than one reply can hold.\n\n"
-        f"**Task id:** `{task['id']}`\n"
-        f"**Scope:** {task['total_units']} units across {len(document_ids)} attached "
-        "document(s).\n\n"
-        "The draft is written in ordered sections and appended as it goes. It is "
-        "never rewritten, so nothing already completed is lost. You can follow the "
-        "progress in the task card, pause or cancel it, and read the finished draft "
-        "when it is done."
+        (
+            "I started a page-by-page classification because this task assigns "
+            "every page to a topic.\n\n"
+            f"**Task id:** `{task['id']}`\n"
+            f"**Scope:** {task['total_units']} pages across {len(document_ids)} attached "
+            "document(s).\n\n"
+            "Each page is classified once and the result is collected into one "
+            "line per topic, pages in order. You can follow progress in the task "
+            "card, pause or cancel it, and read the finished index when it is done."
+        )
+        if task.get("strict")
+        else (
+            "I started a working draft for this long task because it covers more pages "
+            "than one reply can hold.\n\n"
+            f"**Task id:** `{task['id']}`\n"
+            f"**Scope:** {task['total_units']} units across {len(document_ids)} attached "
+            "document(s).\n\n"
+            "The draft is written in ordered sections and appended as it goes. It is "
+            "never rewritten, so nothing already completed is lost. You can follow the "
+            "progress in the task card, pause or cancel it, and read the finished draft "
+            "when it is done."
+        )
     )
     assistant_id, _ = store.archive_message(
         ctx.db,

@@ -127,6 +127,10 @@ class Settings:
     knowledge_enrich_batch: int = 20
     knowledge_auto_folders: int = 3
     docling_path: str = ""
+    mineru_path: str = ""
+    # Document vision mode: "auto" (text layer first, vision only for sparse /
+    # figure-heavy pages), "all" (vision on every page with a drawing), or "off".
+    document_vision_mode: str = "auto"
     knowledge_scan_seconds: int = 120
     # Web search (off by default; each message must opt in)
     web_search_enabled: bool = False
@@ -170,6 +174,8 @@ class Settings:
         self.opencode_port = max(1024, min(int(self.opencode_port), 65535))
         if self.web_search_backend not in ("duckduckgo", "searxng", "brave"):
             self.web_search_backend = "duckduckgo"
+        if self.document_vision_mode not in ("auto", "all", "off"):
+            self.document_vision_mode = "auto"
 
     def to_dict(self) -> dict:
         return asdict(self)

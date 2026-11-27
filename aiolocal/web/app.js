@@ -1220,11 +1220,15 @@
   async function refreshMemory() {
     renderMemoryStats();
     try {
+      const kind = treeKindFilter();
+      const treeUrl = kind
+        ? `/memory/trees?limit=200&kind=${encodeURIComponent(kind)}`
+        : "/memory/trees?limit=200";
       const [topics, summaries, jobs, trees] = await Promise.all([
         api("/memory/topics"),
         api("/memory/summaries?limit=60"),
         api("/memory/jobs?limit=40"),
-        api("/memory/trees?limit=40"),
+        api(treeUrl),
       ]);
 
       const select = $("#mem-topic");
@@ -1241,18 +1245,71 @@
     }
   }
 
+  function treeKindFilter() {
+    const el = $("#tree-kind");
+    return el ? el.value : "";
+  }
+
+  async function refreshTrees() {
+    const kind = treeKindFilter();
+    const url = kind
+      ? `/memory/trees?limit=200&kind=${encodeURIComponent(kind)}`
+      : "/memory/trees?limit=200";
+    const trees = await api(url);
+    renderTreeSelect(trees.data || []);
+    return trees.data || [];
+  }
+
+  async function deleteSelectedTree() {
+    const select = $("#tree-select");
+    const treeId = select ? select.value : "";
+    if (!treeId) {
+      toast("Choose a tree to delete first.", true);
+      return;
+    }
+    const label = select.options[select.selectedIndex]
+      ? select.options[select.selectedIndex].textContent
+      : treeId;
+    if (!window.confirm(`Delete "${label}"?\n\nIts chunks and summaries are removed permanently. The chat or document itself is not deleted.`)) {
+      return;
+    }
+    try {
+      const result = await api(`/memory/trees/${encodeURIComponent(treeId)}`, { method: "DELETE" });
+      toast(`Deleted ${result.nodes || 0} summaries and ${result.chunks || 0} chunks.`);
+      await refreshTrees();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  async function clearTrees() {
+    const kind = treeKindFilter();
+    const scope = kind === "chat" ? "all chat trees" : kind === "document" ? "all document trees" : "all chat and document trees";
+    if (!window.confirm(`Delete ${scope}?\n\nEvery chunk and summary in them is removed permanently. Chats and documents themselves stay.`)) {
+      return;
+    }
+    try {
+      const result = await api(`/memory/trees/clear?kind=${encodeURIComponent(kind)}`, { method: "POST" });
+      toast(`Deleted ${result.deleted || 0} tree(s).`);
+      await refreshTrees();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
   function renderTreeSelect(rows) {
     const select = $("#tree-select");
     if (!select) return;
     const current = select.value;
     select.innerHTML = '<option value="">Choose a tree</option>' +
       rows.map((t) => `<option value="${escapeAttr(t.id)}">${escapeHtml(t.kind)} · ${escapeHtml(t.title || t.id)} (${Number(t.node_count || 0)} nodes)</option>`).join("");
-    if (current) select.value = current;
+    if (current && rows.some((t) => t.id === current)) select.value = current;
     if (!rows.length) {
-      $("#tree-detail").innerHTML = '<p class="muted small">No trees yet. One is created for each chat and each analysed document.</p>';
+      $("#tree-detail").innerHTML = '<p class="muted small">No trees match this filter. One is created for each chat and each analysed document.</p>';
       return;
     }
     if (select.value) refreshTreeDetail(select.value);
+    else $("#tree-detail").innerHTML = '<p class="muted small">Choose a tree above to inspect it.</p>';
   }
 
   async function refreshTreeDetail(treeId) {
@@ -2850,6 +2907,8 @@
     check("#set-memory", s.memory_enabled);
     check("#set-hint", s.memory_hint);
     set("#set-docling", s.docling_path);
+    set("#set-mineru", s.mineru_path);
+    set("#set-doc-vision-mode", s.document_vision_mode || "auto");
     set("#set-opencode-path", s.opencode_path);
     set("#set-opencode-port", s.opencode_port);
     set("#set-workspace", s.workspace_dir);
@@ -2885,6 +2944,8 @@
       memory_enabled: $("#set-memory").checked,
       memory_hint: $("#set-hint").checked,
       docling_path: $("#set-docling").value.trim(),
+      mineru_path: $("#set-mineru").value.trim(),
+      document_vision_mode: $("#set-doc-vision-mode").value,
       opencode_path: $("#set-opencode-path").value.trim(),
       opencode_port: parseInt($("#set-opencode-port").value, 10),
       workspace_dir: $("#set-workspace").value.trim(),
@@ -3074,6 +3135,9 @@
     });
     $("#chat-task-open").addEventListener("click", openTaskDraft);
     $("#tree-select").addEventListener("change", (event) => refreshTreeDetail(event.target.value));
+    $("#tree-kind").addEventListener("change", () => { refreshTrees().catch((err) => toast(err.message, true)); });
+    $("#tree-delete").addEventListener("click", deleteSelectedTree);
+    $("#tree-clear").addEventListener("click", clearTrees);
     $("#chat-document-input").addEventListener("change", (event) => {
       const file = event.target.files && event.target.files[0];
       if (file) startDocumentAnalysis(file);

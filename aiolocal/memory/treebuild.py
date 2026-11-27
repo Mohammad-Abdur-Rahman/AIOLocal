@@ -72,6 +72,9 @@ class TreeBuilder:
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
         self._kicks: dict[str, threading.Event] = {}
+        # One drain at a time per tree: the manual roll-up route and the
+        # background thread must never consume the same group twice.
+        self._drains: dict[str, threading.Lock] = {}
         self._closing = False
 
     # ------------------------------------------------------------------ public
@@ -98,16 +101,19 @@ class TreeBuilder:
         """Synchronously create up to ``max_nodes`` parents. Returns the count."""
         if not tree_id:
             return 0
-        settings = self.settings_store.load()
-        model = self.model or settings.filing_model or settings.chat_model
-        return len(
-            tree.rollup(
-                self.db,
-                tree_id,
-                lambda degree, texts: self._summarise(settings, model, degree, texts),
-                max_nodes=max_nodes,
+        with self._lock:
+            drain_lock = self._drains.setdefault(tree_id, threading.Lock())
+        with drain_lock:
+            settings = self.settings_store.load()
+            model = self.model or settings.filing_model or settings.chat_model
+            return len(
+                tree.rollup(
+                    self.db,
+                    tree_id,
+                    lambda degree, texts: self._summarise(settings, model, degree, texts),
+                    max_nodes=max_nodes,
+                )
             )
-        )
 
     def stop(self, timeout: float = 3.0) -> None:
         self._closing = True
@@ -127,13 +133,22 @@ class TreeBuilder:
         """
         if self._closing:
             return 0
-        added = self._backfill_documents(max_chunks)
+        tombstones = self._tombstones()
+        added = self._backfill_documents(max_chunks, tombstones)
         if added < max_chunks:
-            added += self._backfill_chats(max_chunks - added)
+            added += self._backfill_chats(max_chunks - added, tombstones)
         return added
 
+    def _tombstones(self) -> set[tuple[str, str]]:
+        """Refs whose tree the user deleted; backfill must never recreate them."""
+        with self.db.read() as c:
+            rows = c.execute(
+                "SELECT kind, ref_id FROM memory_tree_tombstones"
+            ).fetchall()
+        return {(str(r["kind"]), str(r["ref_id"])) for r in rows}
+
     # ----------------------------------------------------------------- internal
-    def _backfill_documents(self, budget: int) -> int:
+    def _backfill_documents(self, budget: int, tombstones: set[tuple[str, str]]) -> int:
         with self.db.read() as c:
             docs = c.execute(
                 """SELECT id, title FROM summaries
@@ -146,6 +161,8 @@ class TreeBuilder:
                 break
             doc_added = 0
             doc_id = str(doc["id"])
+            if ("document", doc_id) in tombstones:
+                continue
             tree_id = tree.get_or_create_tree(
                 self.db, kind="document", ref_id=doc_id,
                 title=str(doc["title"] or f"Document {doc_id}"),
@@ -184,7 +201,7 @@ class TreeBuilder:
                 self.kick(tree_id)
         return added
 
-    def _backfill_chats(self, budget: int) -> int:
+    def _backfill_chats(self, budget: int, tombstones: set[tuple[str, str]]) -> int:
         with self.db.read() as c:
             conversations = c.execute(
                 "SELECT id FROM conversations ORDER BY last_at"
@@ -195,6 +212,8 @@ class TreeBuilder:
                 break
             conversation_id = str(conversation["id"])
             conversation_added = 0
+            if ("chat", conversation_id) in tombstones:
+                continue
             tree_id = tree.get_or_create_tree(
                 self.db, kind="chat", ref_id=conversation_id,
                 title=f"Chat {conversation_id}",

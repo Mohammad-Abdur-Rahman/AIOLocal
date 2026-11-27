@@ -4,6 +4,58 @@ All notable changes to AIO Local are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.0] - 2026-11-23
+
+Fast document analysis, strict page classification, and complete memory deletion.
+
+### Added
+
+- **Text-layer fast path.** PDF pages are read from their embedded text layer first;
+  only pages with less than 200 characters (scans, diagrams) fall back to a single-page
+  vision call. A born-digital 204-page document is read in under a second instead of one
+  vision call per page.
+- **Strict index mode.** "Classify every page into these topics" jobs now emit one
+  aggregated line per topic (`Topic Name: 1, 4, 9`, `None` when empty), pages sorted and
+  deduplicated. Pages the model cannot place are reported separately instead of being
+  silently dropped or invented.
+- **Per-page analysis log.** Every page logs its source (text layer or vision), the
+  amount of text produced, and job progress, so a long upload is legible while it runs.
+- **Memory tree deletion tests.** Coverage for tree deletion, ref tombstones, cascade
+  deletion from conversations/documents, and backfill skipping deleted refs.
+- **Self-healing page classifier.** Strict-index jobs classify a batch first, then
+  re-ask about any page the batch skipped or looped on, so an occasional empty or
+  repetitive model answer no longer leaves a page unclassified.
+
+### Changed
+
+- Response-task instruction cap raised from 8,000 to 12,000 characters so a full topic
+  list fits without truncation.
+- Strict-index jobs use their own 10-page segment size and token budget.
+- A shortened topic in the model's answer ("Number: Arithmetic") is folded into the
+  user's full topic instead of being dropped, while a bare ambiguous word such as
+  "Geometry" is never guessed.
+- A topic the model names in its own words ("Exponential Equations & Logarithms",
+  "Standard Form", "Matrices") is mapped onto the user's topic by a keyword alias or
+  the unique closest topic by shared words, so a correct page is no longer lost just
+  because the model did not reuse the exact label.
+
+### Fixed
+
+- A deleted document/session tree no longer reappears after a restart.
+- Unassigned pages in an index are reported rather than lost.
+- A trailing full stop after a page number ("Statistics: 12.") no longer discards the
+  line.
+- A transient empty answer from a busy local model server is retried, and its HTTP
+  status is logged instead of being swallowed.
+- The embedded OpenCode workspace no longer picks a broken `opencode` on PATH. When
+  npm installs `@opencode/cli` without its postinstall step it leaves a tiny text
+  placeholder at `bin\opencode.exe`; Windows refuses it with an "Unsupported 16-Bit
+  Application" dialog. Discovery now checks that a candidate is a real program, prefers
+  the portable copy in `tools\opencode`, and reports a clear message instead of trying
+  to run the placeholder.
+
 ## [0.3.0] - 2026-11-20
 
 A memory redesign. The flat top-k index is still present as a fallback, but long-term

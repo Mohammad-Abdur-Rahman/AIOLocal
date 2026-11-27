@@ -6,9 +6,11 @@ The tree is a Merkle-like roll-up of immutable units:
     node1, node2, node3 (degree 1) -> degree-2 node
     ...                            -> degree-N root
 
-Nothing is ever deleted or rewritten. A unit is *consumed* when it becomes a
-child (``parent_id`` set); consumed units remain readable forever, so a query
-can always descend from a high-level summary back to the exact chunk.
+Nothing is rewritten. A unit is *consumed* when it becomes a child
+(``parent_id`` set); consumed units remain readable forever, so a query can
+always descend from a high-level summary back to the exact chunk. The only
+destructive path is an explicit user delete, which removes a whole tree and
+leaves a tombstone so the startup backfill cannot recreate it.
 
 Retrieval is a beam search, not a flat top-k. It scores every node at the
 current frontier, keeps the *K* best branches, descends into their children,
@@ -201,6 +203,140 @@ def list_trees(db: Database, *, kind: str | None = None, limit: int = 50) -> lis
     return [dict(r) for r in rows]
 
 
+# ------------------------------------------------------------------ deletion
+def delete_tree_rows(c, tree_id: str) -> None:
+    """Delete one tree's rows on an existing connection.
+
+    Kept separate so a conversation/document delete can cascade inside its own
+    transaction without opening a nested write.
+    """
+    c.execute("DELETE FROM tree_node_usage WHERE tree_id=?", (tree_id,))
+    c.execute("DELETE FROM tree_chunks WHERE tree_id=?", (tree_id,))
+    c.execute("DELETE FROM tree_nodes WHERE tree_id=?", (tree_id,))
+    c.execute("DELETE FROM memory_trees WHERE id=?", (tree_id,))
+
+
+def _tombstone(c, kind: str, ref_id: str, deleted_at: int) -> None:
+    c.execute(
+        """INSERT INTO memory_tree_tombstones(kind, ref_id, deleted_at)
+           VALUES(?,?,?)
+           ON CONFLICT(kind, ref_id) DO UPDATE SET deleted_at=excluded.deleted_at""",
+        (kind, ref_id, deleted_at),
+    )
+
+
+def is_tombstoned(db: Database, *, kind: str, ref_id: str) -> bool:
+    """True when the user deleted this ref's tree, so backfill must skip it."""
+    if not ref_id:
+        return False
+    with db.read() as c:
+        row = c.execute(
+            "SELECT 1 FROM memory_tree_tombstones WHERE kind=? AND ref_id=?",
+            (kind, ref_id),
+        ).fetchone()
+    return row is not None
+
+
+def clear_tombstone(c, *, kind: str, ref_id: str) -> None:
+    """Drop a tombstone when its conversation/document no longer exists."""
+    c.execute(
+        "DELETE FROM memory_tree_tombstones WHERE kind=? AND ref_id=?",
+        (kind, ref_id),
+    )
+
+
+def delete_tree(db: Database, tree_id: str) -> dict | None:
+    """Delete one tree and everything under it.
+
+    This is the only destructive path in tree memory and therefore only runs on
+    an explicit user action. The ref is tombstoned so the startup backfill does
+    not silently recreate what was just deleted.
+    """
+    with db.write() as c:
+        row = c.execute(
+            "SELECT kind, ref_id FROM memory_trees WHERE id=?", (tree_id,)
+        ).fetchone()
+        if not row:
+            return None
+        kind = str(row["kind"] or "chat")
+        ref_id = str(row["ref_id"] or "")
+        nodes = c.execute(
+            "SELECT COUNT(*) FROM tree_nodes WHERE tree_id=?", (tree_id,)
+        ).fetchone()[0]
+        chunks = c.execute(
+            "SELECT COUNT(*) FROM tree_chunks WHERE tree_id=?", (tree_id,)
+        ).fetchone()[0]
+        delete_tree_rows(c, tree_id)
+        if ref_id:
+            _tombstone(c, kind, ref_id, now_ms())
+    return {
+        "deleted": tree_id,
+        "kind": kind,
+        "ref_id": ref_id,
+        "nodes": int(nodes or 0),
+        "chunks": int(chunks or 0),
+    }
+
+
+def delete_trees(db: Database, *, kind: str | None = None) -> dict:
+    """Delete every tree of a kind (or all trees).
+
+    Every conversation/document that could be re-imported is tombstoned, not
+    just the refs that currently have a tree, so "delete all" stays deleted.
+    """
+    if kind not in (None, "chat", "document"):
+        raise ValueError("kind must be chat, document or empty")
+    deleted = 0
+    nodes = 0
+    chunks = 0
+    with db.write() as c:
+        sql = "SELECT id, kind, ref_id FROM memory_trees"
+        args: tuple[object, ...] = ()
+        if kind:
+            sql += " WHERE kind=?"
+            args = (kind,)
+        rows = c.execute(sql, args).fetchall()
+        refs: set[tuple[str, str]] = set()
+        for row in rows:
+            ref = str(row["ref_id"] or "")
+            row_kind = str(row["kind"] or "chat")
+            if ref:
+                refs.add((row_kind, ref))
+            nodes += int(
+                c.execute(
+                    "SELECT COUNT(*) FROM tree_nodes WHERE tree_id=?", (row["id"],)
+                ).fetchone()[0]
+                or 0
+            )
+            chunks += int(
+                c.execute(
+                    "SELECT COUNT(*) FROM tree_chunks WHERE tree_id=?", (row["id"],)
+                ).fetchone()[0]
+                or 0
+            )
+            delete_tree_rows(c, str(row["id"]))
+            deleted += 1
+        # Also tombstone refs that have no tree yet, so the next startup cannot
+        # import them into a brand-new tree.
+        if kind in (None, "chat"):
+            for row in c.execute("SELECT id FROM conversations").fetchall():
+                refs.add(("chat", str(row["id"])))
+        if kind in (None, "document"):
+            for row in c.execute(
+                "SELECT id FROM summaries WHERE kind='document' AND merged_into IS NULL"
+            ).fetchall():
+                refs.add(("document", str(row["id"])))
+        now = now_ms()
+        for row_kind, ref in refs:
+            _tombstone(c, row_kind, ref, now)
+    return {
+        "deleted": deleted,
+        "kind": kind or "all",
+        "nodes": nodes,
+        "chunks": chunks,
+    }
+
+
 # --------------------------------------------------------------------- chunks
 def append_chunk(
     db: Database,
@@ -378,6 +514,28 @@ def rollup(
         node_id = new_id()
         now = now_ms()
         with db.write() as c:
+            # Two callers can summarise the same group (a manual roll-up and the
+            # background drain). Only the first may consume it: re-check that
+            # every child is still free inside the write transaction, otherwise
+            # the second would create a duplicate parent for the same units.
+            if degree == 0:
+                marks = ",".join("?" * len(keys))
+                free = c.execute(
+                    f"""SELECT COUNT(*) FROM tree_chunks
+                        WHERE tree_id=? AND parent_id IS NULL AND complete=1
+                          AND chunk_key IN ({marks})""",
+                    (tree_id, *keys),
+                ).fetchone()[0]
+            else:
+                marks = ",".join("?" * len(keys))
+                free = c.execute(
+                    f"""SELECT COUNT(*) FROM tree_nodes
+                        WHERE tree_id=? AND parent_id IS NULL AND state='complete'
+                          AND active=1 AND id IN ({marks})""",
+                    (tree_id, *keys),
+                ).fetchone()[0]
+            if int(free or 0) != len(keys):
+                break
             row = c.execute(
                 "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM tree_nodes "
                 "WHERE tree_id=? AND degree=?",

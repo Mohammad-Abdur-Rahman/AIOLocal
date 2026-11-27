@@ -50,6 +50,22 @@ report*.txt
 /*.png
 depandabot reports/
 
+# Reference sources studied for extraction/memory (downloaded, never shipped)
+docling-*.zip
+MinerU-*.zip
+mineru-*.zip
+raptor-*.zip
+opencode-*.zip
+rea-*.zip
+
+# Local probes / scratch output (the dev_* harnesses we keep are listed below)
+dev_chunks_dump.txt
+dev_dump_chunks.py
+dev_figure_probe.py
+dev_inspect_pages.py
+dev_layout_probe.py
+dev_loop_probe.py
+
 # OS / editors
 .DS_Store
 Thumbs.db

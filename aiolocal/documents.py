@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import re
 import threading
 import time
@@ -34,12 +35,24 @@ import httpx
 
 from .config import Paths, Settings, SettingsStore
 from .db import Database, now_ms
+from .extract import (
+    blocks_for,
+    flags_for,
+    furniture,
+    is_furniture,
+    needs_vision,
+    read_page,
+    render_markdown,
+    PageResult,
+)
 from .llm import api_url
 from .memory import store
 from .memory import semantic
 from .memory import tree, treebuild
 from .memory.text import embed, estimate_tokens, new_id
 from .models import CATALOG, load_custom_models
+
+log = logging.getLogger(__name__)
 
 VISION_SYSTEM = (
     "You are the document indexing engine of a local AI workspace. You read PDF "
@@ -64,15 +77,34 @@ BATCH_PROMPT = """Index page(s) {first}-{last} of "{title}" for long-term memory
 Start directly with the "Page {first}" heading; no preamble.
 
 For EACH page, write a section exactly like "Page N" and cover only what is visible:
-- the subject and purpose of the page;
+- transcribe the printed text of every question, exercise or paragraph, keeping
+  its numbering, sub-parts and wording; do not summarise it into a description
+  and never replace it with phrases like "the page asks the examinee to...";
 - key facts, names, dates, numbers, definitions and conclusions as printed;
-- diagrams, charts and tables: describe axes, labels, values, positions and relationships;
+- tables: transcribe rows and columns as printed, in order;
+- diagrams, charts: describe axes, labels, values, positions and relationships;
 - equations or code: transcribe them exactly; do not solve or complete them;
 - anything a reader would need to find this page again (terms, titles, headings).
 
 Write each fact once, in the place it belongs; do not repeat it in a separate
 summary or bullet list. Do not infer beyond the page. If a page is blank or
 illegible, say so instead of guessing."""
+
+HYBRID_PROMPT = """Page {page} of "{title}" is attached as an image. Its text layer
+has already been transcribed below, and that transcription is kept.
+
+The transcription is usually right about the prose but often breaks tables,
+splits equations and says nothing about diagrams. Add only what it is missing
+or got wrong:
+- describe each diagram or chart: kind, axes, labels, values, positions;
+- repair table rows and columns when the transcription flattened them;
+- transcribe equations exactly as printed.
+
+Do not repeat the transcription, add a heading, or write a preamble. If it is
+already complete and correct, reply with exactly: Nothing missing.
+
+TRANSCRIPTION:
+{native}"""
 
 PARTIAL_PROMPT = """This document analysis was interrupted after {done} of {total} pages.
 
@@ -87,6 +119,24 @@ SECTION_PAGES = 8
 SECTION_GROUP = 10
 MAX_SECTION_CHARS = 2200
 MAX_BODY_CHARS = 20_000
+# A PDF text layer shorter than this is treated as absent (page number, watermark,
+# or an empty scan) and the page is sent to the vision model instead.
+MIN_TEXT_LAYER_CHARS = 200
+
+
+@dataclass
+class PageExtract:
+    """Native reading of one page, plus whether a picture pass should follow.
+
+    ``needs_vision`` is advisory: the page's text layer is good enough to keep
+    (``native`` is True) and only a short visual pass is needed for diagrams and
+    tables. When ``native`` is False the text layer cannot carry the page at all,
+    so the whole page must be read from the image.
+    """
+
+    markdown: str = ""
+    needs_vision: bool = False
+    native: bool = True
 
 
 @dataclass
@@ -167,6 +217,9 @@ class DocumentAnalyzer:
         # One open PDF per analysed path, reused across pages instead of
         # reopening the file for every page (a 584-page job opened it 584 times).
         self._pdf_docs: dict[str, object] = {}
+        # Running headers/footers detected per document path, computed once by
+        # sampling a few pages and reused for every page of that job.
+        self._running_cache: dict[str, set[str]] = {}
         self._closing = False
         self._pending: list[DocumentJob] = []
         if not self.deferred:
@@ -401,11 +454,15 @@ class DocumentAnalyzer:
             self._fail(job, f"could not open the PDF ({type(exc).__name__}: {exc})")
             return
 
-        # One page per vision call is the accuracy setting, not a preference.
+        # One page per call is the accuracy setting, not a preference.
         step = 1
         job.batches_total = job.pages_total
         if job.state != "running":
             job.state = "running"
+        log.info(
+            "document %s started: %r, %d pages, model %s",
+            job.id, job.filename, job.pages_total, job.model,
+        )
         self._save_job(job)
         self._emit(job)
 
@@ -457,18 +514,40 @@ class DocumentAnalyzer:
                     self._save_job(job)
                     self._emit(job)
                 end = min(job.pages_total, start + step - 1)
-                images = self._render_pages(job.path, start, end, settings.document_dpi)
-                if not images:
-                    raise DocumentError(f"could not render pages {start}-{end}")
-                text = self._vision_batch(
-                    settings, job.model, job.title, start, end, images
+                # Fast path: a born-digital page is read through the layout-aware
+                # extractor (questions, headings, tables, equations, figures) and
+                # stored as structured Markdown. A page whose text layer cannot
+                # carry it (a scan) is transcribed from the image; a good page
+                # with drawings gets a short visual pass for the drawings only,
+                # so the reliable text layer is never thrown away.
+                extracted = self._extract_text(
+                    job.path, start, end, vision_mode=settings.document_vision_mode
                 )
+                text = extracted.markdown
+                source = "text"
+                if extracted.needs_vision:
+                    images = self._render_pages(job.path, start, end, settings.document_dpi)
+                    if not images:
+                        raise DocumentError(f"could not render pages {start}-{end}")
+                    if extracted.native and text.strip():
+                        notes = self._vision_notes(
+                            settings, job.model, job.title, start, images[0], text
+                        )
+                        if notes and "nothing missing" not in notes.lower():
+                            text = f"{text}\n\n**Visual notes.** {notes}"
+                        source = "text+vision"
+                    else:
+                        text = self._vision_batch(
+                            settings, job.model, job.title, start, end, images
+                        )
+                        source = "vision"
                 self._store_pages(job, start, end, text, settings.embed_dim)
                 job.pages_done = end
                 job.batches_done = (end + step - 1) // step
                 job.state = "running"
                 self._save_job(job)
                 self._emit(job)
+                self._log_page(job, start, end, source, text)
 
             if job.cancel.is_set() or job.pause.is_set():
                 job.state = "interrupted" if self._closing else (
@@ -495,10 +574,15 @@ class DocumentAnalyzer:
                 pass
             job.state = "done"
             job.error = ""
+            log.info("document %s done: %d/%d pages", job.id, job.pages_done, job.pages_total)
             self._save_job(job)
             self._emit(job)
         except Exception as exc:
             job.error = f"{type(exc).__name__}: {exc}"[:1000]
+            log.warning(
+                "document %s failed at page %d/%d: %s",
+                job.id, job.pages_done, job.pages_total, job.error,
+            )
             pages = self._pages_done(job.summary_id)
             try:
                 if job.summary_id and pages:
@@ -525,6 +609,107 @@ class DocumentAnalyzer:
                     pass
 
     # ------------------------------------------------------------------ pages
+    def _log_page(
+        self, job: DocumentJob, first: int, last: int, source: str, text: str
+    ) -> None:
+        """One line per analysed page so a running job is legible in the log.
+
+        The user can watch the upload progress without reading the database:
+        which page was read, whether it came from the text layer or vision, how
+        much text it produced and how far the job has got.
+        """
+        chars = len(text or "")
+        log.info(
+            "document %s page %s-%s via %s: %d chars (%d/%d pages)",
+            job.id, first, last, source, chars, job.pages_done, job.pages_total,
+        )
+
+    def _running_furniture_for(self, path: str, pdf) -> set[str]:
+        """Running headers/footers for one document, sampled once and cached.
+
+        Furniture removal keeps repeating page numbers and "Page N of M" lines
+        out of the per-page text so they are not stored as content.
+        """
+        key = str(path)
+        with self._lock:
+            cached = self._running_cache.get(key)
+        if cached is not None:
+            return cached
+        sample: dict[int, list] = {}
+        total = len(pdf)
+        step = max(1, total // 24)
+        for page_no in range(1, total + 1, step):
+            try:
+                sample[page_no] = read_page(pdf, page_no).lines
+            except Exception:
+                continue
+        if total > 2:
+            for page_no in (1, total):
+                try:
+                    sample[page_no] = read_page(pdf, page_no).lines
+                except Exception:
+                    pass
+        running = furniture(sample)
+        with self._lock:
+            self._running_cache[key] = running
+        return running
+
+    def _extract_text(
+        self, path: str, first: int, last: int, *, vision_mode: str = "auto"
+    ) -> PageExtract:
+        """Read pages through the native layout extractor.
+
+        Each page is split into typed blocks (question, heading, table, equation,
+        figure, text) and rendered as structured Markdown. A page with a good
+        text layer is kept even when it has drawings: the caller only adds a
+        short visual pass for the drawings. A page whose text layer cannot
+        carry it (a scan, a chart sheet) is marked ``native=False`` and read
+        entirely from the image. Reusing the already-open document avoids
+        reopening the file once per page.
+        """
+        try:
+            pdf = self._get_pdf(path)
+        except Exception:
+            return PageExtract(native=False, needs_vision=True)
+        running = self._running_furniture_for(path, pdf)
+        parts: list[str] = []
+        needs = False
+        try:
+            for index in range(first - 1, last):
+                page_no = index + 1
+                try:
+                    layout = read_page(pdf, page_no)
+                except Exception:
+                    # Cannot read this page natively: let vision handle it.
+                    return PageExtract(native=False, needs_vision=True)
+                blocks = blocks_for(layout, running)
+                markdown = render_markdown(blocks)
+                if not markdown.strip() and layout.lines:
+                    # No confidence in the structure: keep the ordered text so
+                    # nothing is silently lost.
+                    markdown = "\n".join(
+                        ln.text for ln in layout.lines if not is_furniture(ln, running, layout)
+                    )
+                result = PageResult(
+                    page_no=page_no,
+                    markdown=markdown,
+                    source="native",
+                    blocks=blocks,
+                    flags=flags_for(layout, blocks),
+                )
+                if needs_vision(result, vision_mode):
+                    needs = True
+                parts.append(markdown)
+        except Exception:
+            return PageExtract(native=False, needs_vision=True)
+        combined = "\n\n".join(part for part in parts if part.strip()).strip()
+        if not combined:
+            return PageExtract(native=False, needs_vision=True)
+        if needs and len(combined) < MIN_TEXT_LAYER_CHARS:
+            # Too little text to be trusted: read the whole page from the image.
+            return PageExtract(native=False, needs_vision=True)
+        return PageExtract(markdown=combined, needs_vision=needs, native=True)
+
     def _pages_done(self, document_id: str) -> int:
         """Number of contiguous pages stored from page 1 upward.
 
@@ -1040,6 +1225,58 @@ class DocumentAnalyzer:
             raise DocumentError(f"the model returned an empty analysis for pages {first}-{last}")
         return text
 
+    def _vision_notes(
+        self,
+        settings: Settings,
+        model: str,
+        title: str,
+        page_no: int,
+        image: bytes,
+        native: str,
+    ) -> str:
+        """Short visual pass over a page whose native text is already good.
+
+        The text layer carries the prose, so the model only has to describe the
+        diagrams and repair tables/equations. The output is deliberately capped:
+        this must stay cheaper than transcribing the page again.
+        """
+        encoded = base64.b64encode(image).decode("ascii")
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": VISION_SYSTEM},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": HYBRID_PROMPT.format(
+                                page=page_no, title=title, native=native[:6000]
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                        },
+                    ],
+                },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 700,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        url = api_url(settings.upstream_base_url, "chat/completions")
+        try:
+            with self._client(settings) as client:
+                response = client.post(url, json=payload)
+            if response.status_code >= 400:
+                return ""
+            content = response.json()["choices"][0]["message"].get("content") or ""
+        except Exception:
+            return ""
+        return str(content).strip()[:8000]
+
 
 def _split_page_text(text: str, first: int, last: int) -> dict[int, str]:
     """Split a multi-page vision answer into per-page notes when possible."""
@@ -1067,3 +1304,47 @@ def _section_summary(
     body = " ".join(" ".join(t.split())[:420] for t in texts)
     body = body[:limit].strip()
     return f"Pages {start}-{end}: {body}"
+
+
+def _page_text(path: str, first: int, last: int) -> str | None:
+    """Extract text from a PDF's text layer for pages ``first``..``last``.
+
+    Returns the combined text when it is substantial enough to classify, or
+    ``None`` when the layer is missing/too sparse and a vision pass is required.
+    This is the fast path: a born-digital PDF never needs a vision call.
+    """
+    try:
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(path)
+        parts: list[str] = []
+        try:
+            for index in range(first - 1, last):
+                page = pdf[index]
+                textpage = None
+                try:
+                    textpage = page.get_textpage()
+                    parts.append(textpage.get_text_range())
+                except Exception:
+                    parts.append("")
+                finally:
+                    if textpage is not None:
+                        try:
+                            textpage.close()
+                        except Exception:
+                            pass
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+        finally:
+            try:
+                pdf.close()
+            except Exception:
+                pass
+        combined = "\n".join(part.strip() for part in parts if part.strip()).strip()
+        # Below this threshold the layer is usually just a page number or a
+        # watermark, which cannot carry a classification, so use vision instead.
+        return combined if len(combined) >= MIN_TEXT_LAYER_CHARS else None
+    except Exception:
+        return None

@@ -72,6 +72,53 @@ def _b64url(text: str) -> str:
     return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
 
 
+def _is_windows_program(path: Path) -> bool:
+    """True when ``path`` is a real Windows image, not a text stand-in.
+
+    When npm installs ``@opencode/cli`` without running its postinstall script it
+    leaves a tiny shell-script placeholder at ``bin/opencode.exe``. Windows then
+    refuses to launch it with an "Unsupported 16-Bit Application" dialog. Every
+    real PE image starts with ``MZ``; reading two bytes is enough to tell them
+    apart without executing anything.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
+_BATCH_DP0 = re.compile(r"%~?dp0%?", re.IGNORECASE)
+
+
+def _batch_target(path: Path) -> Path | None:
+    """Best-effort program a small batch shim (npm's ``opencode.cmd``) runs."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r'"([^"]+?\.exe)"', text, re.IGNORECASE)
+    if not match:
+        return None
+    target = _BATCH_DP0.sub(lambda _m: str(path.parent), match.group(1))
+    return Path(target)
+
+
+def _launchable(path: Path) -> bool:
+    """Reject files the loader would refuse (e.g. an npm placeholder ``.exe``)."""
+    if os.name != "nt":
+        return True
+    suffix = path.suffix.lower()
+    if suffix == ".exe":
+        return _is_windows_program(path)
+    if suffix in (".cmd", ".bat"):
+        target = _batch_target(path)
+        # Unrecognised shims are left to the operating system; a shim we *can*
+        # read is only trusted when the program it runs is a real image.
+        return True if target is None else _is_windows_program(target)
+    return True
+
+
 class CodeWorkspace:
     def __init__(
         self,
@@ -89,10 +136,12 @@ class CodeWorkspace:
         self._log = None
         self._reader: threading.Thread | None = None
         self._version_cache: str | None = None
+        self._version_checked = False
         self._password = ""
         self._port = 0
         self._session_id = ""
         self._start_error = ""
+        self._discovery_note = ""
         self._ready = threading.Event()
         self._log_tail_lines: list[str] = []
         self._log_lock = threading.Lock()
@@ -100,12 +149,17 @@ class CodeWorkspace:
 
     # ------------------------------------------------------------------ discovery
     def executable(self) -> str | None:
+        self._discovery_note = ""
         settings = self.settings_store.load()
         configured = (settings.opencode_path or "").strip().strip('"')
         if configured:
             path = Path(configured)
             if path.is_file():
-                return str(path)
+                if _launchable(path):
+                    return str(path)
+                self._discovery_note = (
+                    f"the configured executable is not a working program: {path}"
+                )
             return None
         # Portable copy installed by the requirements manager.
         portable = self.paths.tools_dir / "opencode"
@@ -115,11 +169,21 @@ class CodeWorkspace:
             portable / "opencode-windows-x64" / "opencode.exe",
         ):
             if candidate.is_file():
-                return str(candidate)
+                if _launchable(candidate):
+                    return str(candidate)
+                self._discovery_note = (
+                    f"the portable OpenCode is not a working program: {candidate}"
+                )
         for name in ("opencode", "opencode.cmd", "opencode.exe"):
             found = shutil.which(name)
-            if found:
-                return found
+            if not found:
+                continue
+            candidate = Path(found)
+            if _launchable(candidate):
+                return str(candidate)
+            self._discovery_note = (
+                f"the '{name}' on PATH is not a working program: {found}"
+            )
         # The OpenCode desktop app ships a CLI/server that is not added to PATH.
         local = os.environ.get("LOCALAPPDATA")
         if local:
@@ -129,7 +193,7 @@ class CodeWorkspace:
                 r"Programs\OpenCode\opencode.exe",
             ):
                 candidate = Path(local) / relative
-                if candidate.is_file():
+                if candidate.is_file() and _launchable(candidate):
                     return str(candidate)
         return None
 
@@ -167,8 +231,9 @@ class CodeWorkspace:
         return root.resolve()
 
     def version(self) -> str | None:
-        if self._version_cache is not None:
-            return self._version_cache
+        if self._version_checked:
+            return self._version_cache or None
+        self._version_checked = True
         exe = self.executable()
         if not exe:
             return None
@@ -180,10 +245,12 @@ class CodeWorkspace:
                 creationflags=0x08000000 if os.name == "nt" else 0,
             )
             text = (proc.stdout or proc.stderr).decode("utf-8", "replace").strip()
-            self._version_cache = text[:120] or "installed"
+            # A placeholder or half-installed binary answers non-zero; report it
+            # as missing instead of echoing its error text as a version.
+            self._version_cache = text[:120] if proc.returncode == 0 and text else ""
         except (OSError, subprocess.SubprocessError):
-            self._version_cache = None
-        return self._version_cache
+            self._version_cache = ""
+        return self._version_cache or None
 
     def node_version(self) -> str | None:
         node = self.node_executable()
@@ -385,8 +452,10 @@ class CodeWorkspace:
                 }
             exe = self.executable()
             if not exe:
+                detail = f" ({self._discovery_note})" if self._discovery_note else ""
                 raise ValueError(
-                    "OpenCode was not found. Install it from Setup, or set the executable in Settings."
+                    "OpenCode was not found. Install it from Setup, or set the "
+                    f"executable in Settings.{detail}"
                 )
             settings = self.settings_store.load()
             workspace = self.workspace()
